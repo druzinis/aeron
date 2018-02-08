@@ -15,26 +15,21 @@
  */
 package io.aeron;
 
-import org.junit.Before;
-import org.junit.Test;
 import io.aeron.logbuffer.BufferClaim;
 import io.aeron.logbuffer.FrameDescriptor;
-
+import io.aeron.status.ChannelEndpointStatus;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.ReadablePosition;
-import org.mockito.InOrder;
-import org.mockito.Mockito;
+import org.junit.Before;
+import org.junit.Test;
 
 import java.nio.ByteBuffer;
-import java.util.concurrent.locks.Lock;
 
+import static io.aeron.logbuffer.LogBufferDescriptor.*;
 import static java.nio.ByteBuffer.allocateDirect;
 import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
-import static io.aeron.logbuffer.LogBufferDescriptor.*;
 
 public class PublicationTest
 {
@@ -46,49 +41,56 @@ public class PublicationTest
     private static final int SEND_BUFFER_CAPACITY = 1024;
     private static final int PARTITION_INDEX = 0;
     private static final int MTU_LENGTH = 4096;
+    private static final int PAGE_SIZE = 4 * 1024;
 
     private final ByteBuffer sendBuffer = allocateDirect(SEND_BUFFER_CAPACITY);
     private final UnsafeBuffer atomicSendBuffer = new UnsafeBuffer(sendBuffer);
     private final UnsafeBuffer logMetaDataBuffer = spy(new UnsafeBuffer(allocateDirect(LOG_META_DATA_LENGTH)));
     private final UnsafeBuffer[] termBuffers = new UnsafeBuffer[PARTITION_COUNT];
 
-    private final Lock conductorLock = mock(Lock.class);
     private final ClientConductor conductor = mock(ClientConductor.class);
     private final LogBuffers logBuffers = mock(LogBuffers.class);
     private final ReadablePosition publicationLimit = mock(ReadablePosition.class);
-    private Publication publication;
+    private ConcurrentPublication publication;
 
     @Before
     public void setUp()
     {
         when(publicationLimit.getVolatile()).thenReturn(2L * SEND_BUFFER_CAPACITY);
-        when(logBuffers.termBuffers()).thenReturn(termBuffers);
+        when(logBuffers.duplicateTermBuffers()).thenReturn(termBuffers);
         when(logBuffers.termLength()).thenReturn(TERM_MIN_LENGTH);
         when(logBuffers.metaDataBuffer()).thenReturn(logMetaDataBuffer);
-        when(conductor.clientLock()).thenReturn(conductorLock);
 
         initialTermId(logMetaDataBuffer, TERM_ID_1);
         mtuLength(logMetaDataBuffer, MTU_LENGTH);
-        timeOfLastStatusMessage(logMetaDataBuffer, 0);
+        termLength(logMetaDataBuffer, TERM_MIN_LENGTH);
+        pageSize(logMetaDataBuffer, PAGE_SIZE);
+        isConnected(logMetaDataBuffer, false);
 
         for (int i = 0; i < PARTITION_COUNT; i++)
         {
             termBuffers[i] = new UnsafeBuffer(allocateDirect(TERM_MIN_LENGTH));
         }
 
-        publication = new Publication(
+        publication = new ConcurrentPublication(
             conductor,
             CHANNEL,
             STREAM_ID_1,
             SESSION_ID_1,
             publicationLimit,
+            ChannelEndpointStatus.NO_ID_ALLOCATED,
             logBuffers,
             CORRELATION_ID,
             CORRELATION_ID);
 
-        publication.incRef();
-
         initialiseTailWithTermId(logMetaDataBuffer, PARTITION_INDEX, TERM_ID_1);
+
+        doAnswer(
+            (invocation) ->
+            {
+                publication.internalClose();
+                return null;
+            }).when(conductor).releasePublication(publication);
     }
 
     @Test
@@ -97,10 +99,7 @@ public class PublicationTest
         publication.close();
         assertThat(publication.position(), is(Publication.CLOSED));
 
-        final InOrder inOrder = Mockito.inOrder(conductorLock, conductor);
-        inOrder.verify(conductorLock).lock();
-        inOrder.verify(conductor).releasePublication(publication);
-        inOrder.verify(conductorLock).unlock();
+        verify(conductor).releasePublication(publication);
     }
 
     @Test
@@ -123,14 +122,14 @@ public class PublicationTest
     public void shouldReportThatPublicationHasNotBeenConnectedYet()
     {
         when(publicationLimit.getVolatile()).thenReturn(0L);
-        when(conductor.isPublicationConnected(anyLong())).thenReturn(false);
+        isConnected(logMetaDataBuffer, false);
         assertFalse(publication.isConnected());
     }
 
     @Test
     public void shouldReportThatPublicationHasBeenConnectedYet()
     {
-        when(conductor.isPublicationConnected(anyLong())).thenReturn(true);
+        isConnected(logMetaDataBuffer, true);
         assertTrue(publication.isConnected());
     }
 
@@ -147,46 +146,10 @@ public class PublicationTest
     }
 
     @Test
-    public void shouldNotUnmapBuffersBeforeLastRelease() throws Exception
-    {
-        publication.incRef();
-        publication.close();
-
-        verify(logBuffers, never()).close();
-
-        final InOrder inOrder = Mockito.inOrder(conductorLock, conductor);
-        inOrder.verify(conductorLock).lock();
-        inOrder.verify(conductorLock).unlock();
-        inOrder.verifyNoMoreInteractions();
-    }
-
-    @Test
-    public void shouldUnmapBuffersWithMultipleReferences() throws Exception
-    {
-        publication.incRef();
-        publication.close();
-
-        publication.close();
-
-        final InOrder inOrder = Mockito.inOrder(conductorLock, conductor);
-        inOrder.verify(conductorLock).lock();
-        inOrder.verify(conductor).releasePublication(publication);
-        inOrder.verify(conductorLock).unlock();
-        inOrder.verifyNoMoreInteractions();
-    }
-
-    @Test
-    public void shouldReleaseResourcesIdempotently() throws Exception
+    public void shouldReleasePublicationOnClose()
     {
         publication.close();
-        publication.close();
 
-        final InOrder inOrder = Mockito.inOrder(conductorLock, conductor);
-        inOrder.verify(conductorLock).lock();
-        inOrder.verify(conductor).releasePublication(publication);
-        inOrder.verify(conductorLock).unlock();
-        inOrder.verify(conductorLock).lock();
-        inOrder.verify(conductorLock).unlock();
-        inOrder.verifyNoMoreInteractions();
+        verify(conductor).releasePublication(publication);
     }
 }

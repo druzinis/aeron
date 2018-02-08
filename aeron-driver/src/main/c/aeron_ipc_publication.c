@@ -16,7 +16,8 @@
 
 #include <string.h>
 #include <errno.h>
-#include <concurrent/aeron_counters_manager.h>
+#include "concurrent/aeron_counters_manager.h"
+#include "concurrent/aeron_logbuffer_unblocker.h"
 #include "aeron_ipc_publication.h"
 #include "util/aeron_fileutil.h"
 #include "aeron_alloc.h"
@@ -34,14 +35,16 @@ int aeron_ipc_publication_create(
     int32_t initial_term_id,
     size_t term_buffer_length,
     size_t mtu_length,
-    bool is_exclusive)
+    bool is_exclusive,
+    aeron_system_counters_t *system_counters)
 {
     char path[AERON_MAX_PATH];
     int path_length =
         aeron_ipc_publication_location(path, sizeof(path), context->aeron_dir, session_id, stream_id, registration_id);
     aeron_ipc_publication_t *_pub = NULL;
     const uint64_t usable_fs_space = context->usable_fs_space_func(context->aeron_dir);
-    const uint64_t log_length = AERON_LOGBUFFER_COMPUTE_LOG_LENGTH(term_buffer_length);
+    const uint64_t log_length = aeron_logbuffer_compute_log_length(term_buffer_length, context->file_page_size);
+    const int64_t now_ns = context->nano_clock();
 
     *publication = NULL;
 
@@ -65,7 +68,8 @@ int aeron_ipc_publication_create(
         return -1;
     }
 
-    if (context->map_raw_log_func(&_pub->mapped_raw_log, path, context->term_buffer_sparse_file, term_buffer_length) < 0)
+    if (context->map_raw_log_func(
+        &_pub->mapped_raw_log, path, context->term_buffer_sparse_file, term_buffer_length, context->file_page_size) < 0)
     {
         aeron_free(_pub->log_file_name);
         aeron_free(_pub);
@@ -80,17 +84,30 @@ int aeron_ipc_publication_create(
     _pub->log_meta_data = (aeron_logbuffer_metadata_t *)(_pub->mapped_raw_log.log_meta_data.addr);
 
     _pub->log_meta_data->term_tail_counters[0] = (int64_t)initial_term_id << 32;
-    _pub->log_meta_data->initialTerm_id = initial_term_id;
+    for (int i = 1; i < AERON_LOGBUFFER_PARTITION_COUNT; i++)
+    {
+        const int64_t expected_term_id = (initial_term_id + i) - AERON_LOGBUFFER_PARTITION_COUNT;
+        _pub->log_meta_data->term_tail_counters[i] = expected_term_id << 32;
+    }
+
+    _pub->log_meta_data->active_term_count = 0;
+    _pub->log_meta_data->initial_term_id = initial_term_id;
     _pub->log_meta_data->mtu_length = (int32_t)mtu_length;
+    _pub->log_meta_data->term_length = (int32_t)term_buffer_length;
+    _pub->log_meta_data->page_size = (int32_t)context->file_page_size;
     _pub->log_meta_data->correlation_id = registration_id;
-    _pub->log_meta_data->time_of_last_status_message = 0;
+    _pub->log_meta_data->is_connected = 0;
     _pub->log_meta_data->end_of_stream_position = INT64_MAX;
     aeron_logbuffer_fill_default_header(
         _pub->mapped_raw_log.log_meta_data.addr, session_id, stream_id, initial_term_id);
 
-    _pub->conductor_fields.subscribeable.array = NULL;
-    _pub->conductor_fields.subscribeable.length = 0;
-    _pub->conductor_fields.subscribeable.capacity = 0;
+    _pub->nano_clock = context->nano_clock;
+    _pub->conductor_fields.subscribable.array = NULL;
+    _pub->conductor_fields.subscribable.length = 0;
+    _pub->conductor_fields.subscribable.capacity = 0;
+    _pub->conductor_fields.subscribable.add_position_hook_func = aeron_ipc_publication_add_subscriber_hook;
+    _pub->conductor_fields.subscribable.remove_position_hook_func = aeron_ipc_publication_remove_subscriber_hook;
+    _pub->conductor_fields.subscribable.clientd = _pub;
     _pub->conductor_fields.managed_resource.registration_id = registration_id;
     _pub->conductor_fields.managed_resource.clientd = _pub;
     _pub->conductor_fields.managed_resource.incref = aeron_ipc_publication_incref;
@@ -99,6 +116,8 @@ int aeron_ipc_publication_create(
     _pub->conductor_fields.cleaning_position = 0;
     _pub->conductor_fields.trip_limit = 0;
     _pub->conductor_fields.consumer_position = 0;
+    _pub->conductor_fields.last_consumer_position = 0;
+    _pub->conductor_fields.time_of_last_consumer_position_change = now_ns;
     _pub->conductor_fields.status = AERON_IPC_PUBLICATION_STATUS_ACTIVE;
     _pub->conductor_fields.refcnt = 1;
     _pub->session_id = session_id;
@@ -110,9 +129,14 @@ int aeron_ipc_publication_create(
     _pub->term_window_length = (int64_t)aeron_ipc_publication_term_window_length(context, term_buffer_length);
     _pub->trip_gain = _pub->term_window_length / 8;
     _pub->linger_timeout_ns = (int64_t)context->publication_linger_timeout_ns;
+    _pub->unblock_timeout_ns = (int64_t)context->publication_unblock_timeout_ns;
     _pub->is_exclusive = is_exclusive;
 
     _pub->conductor_fields.consumer_position = aeron_ipc_publication_producer_position(_pub);
+    _pub->conductor_fields.last_consumer_position = _pub->conductor_fields.consumer_position;
+
+    _pub->unblocked_publications_counter =
+        aeron_system_counter_addr(system_counters, AERON_SYSTEM_COUNTER_UNBLOCKED_PUBLICATIONS);
 
     *publication = _pub;
     return 0;
@@ -120,14 +144,15 @@ int aeron_ipc_publication_create(
 
 void aeron_ipc_publication_close(aeron_counters_manager_t *counters_manager, aeron_ipc_publication_t *publication)
 {
-    aeron_subscribeable_t *subscribeable = &publication->conductor_fields.subscribeable;
+    aeron_subscribable_t *subscribable = &publication->conductor_fields.subscribable;
 
     aeron_counters_manager_free(counters_manager, (int32_t)publication->pub_lmt_position.counter_id);
 
-    for (size_t i = 0, length = subscribeable->length; i < length; i++)
+    for (size_t i = 0, length = subscribable->length; i < length; i++)
     {
-        aeron_counters_manager_free(counters_manager, (int32_t)subscribeable->array[i].counter_id);
+        aeron_counters_manager_free(counters_manager, (int32_t)subscribable->array[i].counter_id);
     }
+    aeron_free(subscribable->array);
 
     if (NULL != publication)
     {
@@ -144,15 +169,15 @@ int aeron_ipc_publication_update_pub_lmt(aeron_ipc_publication_t *publication)
     int64_t min_sub_pos = INT64_MAX;
     int64_t max_sub_pos = publication->conductor_fields.consumer_position;
 
-    for (size_t i = 0, length = publication->conductor_fields.subscribeable.length; i < length; i++)
+    for (size_t i = 0, length = publication->conductor_fields.subscribable.length; i < length; i++)
     {
-        int64_t position = aeron_counter_get_volatile(publication->conductor_fields.subscribeable.array[i].value_addr);
+        int64_t position = aeron_counter_get_volatile(publication->conductor_fields.subscribable.array[i].value_addr);
 
         min_sub_pos = (position < min_sub_pos) ? (position) : (min_sub_pos);
         max_sub_pos = (position > max_sub_pos) ? (position) : (max_sub_pos);
     }
 
-    if (0 == publication->conductor_fields.subscribeable.length)
+    if (0 == publication->conductor_fields.subscribable.length)
     {
         aeron_counter_set_ordered(publication->pub_lmt_position.value_addr, max_sub_pos);
         publication->conductor_fields.trip_limit = max_sub_pos;
@@ -178,27 +203,33 @@ int aeron_ipc_publication_update_pub_lmt(aeron_ipc_publication_t *publication)
 void aeron_ipc_publication_clean_buffer(aeron_ipc_publication_t *publication, int64_t min_sub_pos)
 {
     int64_t cleaning_position = publication->conductor_fields.cleaning_position;
-    size_t dirty_index = aeron_logbuffer_index_by_position(min_sub_pos, publication->position_bits_to_shift);
-    size_t bytes_to_clean = (size_t)(min_sub_pos - cleaning_position);
-    size_t term_length = publication->mapped_raw_log.term_length;
+    size_t dirty_index = aeron_logbuffer_index_by_position(cleaning_position, publication->position_bits_to_shift);
+    int32_t bytes_to_clean = (int32_t)(min_sub_pos - cleaning_position);
+    int32_t term_length = (int32_t)publication->mapped_raw_log.term_length;
     int32_t term_offset = (int32_t)(cleaning_position & (term_length - 1));
-    size_t bytes_left_in_term = term_length - term_offset;
-    size_t length = bytes_to_clean < bytes_left_in_term ? bytes_to_clean : bytes_left_in_term;
+    int32_t bytes_left_in_term = term_length - term_offset;
+    int32_t length = bytes_to_clean < bytes_left_in_term ? bytes_to_clean : bytes_left_in_term;
 
     if (0 < length)
     {
         memset(publication->mapped_raw_log.term_buffers[dirty_index].addr + term_offset, 0, length);
-        publication->conductor_fields.cleaning_position = min_sub_pos;
+        publication->conductor_fields.cleaning_position = cleaning_position + length;
     }
 }
 
 void aeron_ipc_publication_on_time_event(aeron_ipc_publication_t *publication, int64_t now_ns, int64_t now_ms)
 {
-    aeron_ipc_publication_check_for_blocked_publisher(publication, now_ns);
-
-    if (0 < publication->conductor_fields.subscribeable.length)
+    switch (publication->conductor_fields.status)
     {
-        AERON_PUT_ORDERED(publication->log_meta_data->time_of_last_status_message, now_ms);
+        case AERON_IPC_PUBLICATION_STATUS_ACTIVE:
+            if (!publication->is_exclusive)
+            {
+                aeron_ipc_publication_check_for_blocked_publisher(publication, now_ns);
+            }
+            break;
+
+        default:
+            break;
     }
 }
 
@@ -223,9 +254,33 @@ void aeron_ipc_publication_decref(void *clientd)
 
 void aeron_ipc_publication_check_for_blocked_publisher(aeron_ipc_publication_t *publication, int64_t now_ns)
 {
-    /* TODO: finish */
+    int64_t consumer_position = publication->conductor_fields.consumer_position;
+
+    if (consumer_position == publication->conductor_fields.last_consumer_position &&
+        aeron_ipc_publication_is_possibly_blocked(publication, consumer_position))
+    {
+        if (now_ns > (publication->conductor_fields.time_of_last_consumer_position_change + publication->unblock_timeout_ns))
+        {
+            if (aeron_logbuffer_unblocker_unblock(
+                publication->mapped_raw_log.term_buffers,
+                publication->log_meta_data,
+                publication->conductor_fields.consumer_position))
+            {
+                aeron_counter_ordered_increment(publication->unblocked_publications_counter, 1);
+            }
+        }
+    }
+    else
+    {
+        publication->conductor_fields.time_of_last_consumer_position_change = now_ns;
+        publication->conductor_fields.last_consumer_position = publication->conductor_fields.consumer_position;
+    }
 }
 
+extern void aeron_ipc_publication_add_subscriber_hook(void *clientd, int64_t *value_addr);
+extern void aeron_ipc_publication_remove_subscriber_hook(void *clientd, int64_t *value_addr);
+extern bool aeron_ipc_publication_is_possibly_blocked(
+    aeron_ipc_publication_t *publication, int64_t consumer_position);
 extern int64_t aeron_ipc_publication_producer_position(aeron_ipc_publication_t *publication);
 extern int64_t aeron_ipc_publication_joining_position(aeron_ipc_publication_t *publication);
 extern bool aeron_ipc_publication_has_reached_end_of_life(aeron_ipc_publication_t *publication);

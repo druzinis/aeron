@@ -59,6 +59,17 @@ public class LogBufferDescriptor
      */
     public static final int TERM_MAX_LENGTH = 1024 * 1024 * 1024;
 
+    /**
+     * Minimum page size
+     */
+    public static final int PAGE_MIN_SIZE = 4 * 1024;
+
+    /**
+     * Maximum page size
+     */
+    public static final int PAGE_MAX_SIZE = 1024 * 1024 * 1024;
+
+
     // *******************************
     // *** Log Meta Data Constants ***
     // *******************************
@@ -71,17 +82,17 @@ public class LogBufferDescriptor
     /**
      * Offset within the log meta data where the active partition index is stored.
      */
-    public static final int LOG_ACTIVE_PARTITION_INDEX_OFFSET;
-
-    /**
-     * Offset within the log meta data where the time of last SM is stored.
-     */
-    public static final int LOG_TIME_OF_LAST_SM_OFFSET;
+    public static final int LOG_ACTIVE_TERM_COUNT_OFFSET;
 
     /**
      * Offset within the log meta data where the position of the End of Stream is stored.
      */
     public static final int LOG_END_OF_STREAM_POSITION_OFFSET;
+
+    /**
+     * Offset within the log meta data where whether the log is connected or not is stored.
+     */
+    public static final int LOG_IS_CONNECTED_OFFSET;
 
     /**
      * Offset within the log meta data where the active term id is stored.
@@ -94,14 +105,24 @@ public class LogBufferDescriptor
     public static final int LOG_DEFAULT_FRAME_HEADER_LENGTH_OFFSET;
 
     /**
-     * Offset within the log meta data which the MTU length is stored;
+     * Offset within the log meta data which the MTU length is stored.
      */
     public static final int LOG_MTU_LENGTH_OFFSET;
 
     /**
-     * Offset within the log meta data which the
+     * Offset within the log meta data which the correlation id is stored.
      */
     public static final int LOG_CORRELATION_ID_OFFSET;
+
+    /**
+     * Offset within the log meta data which the term length is stored.
+     */
+    public static final int LOG_TERM_LENGTH_OFFSET;
+
+    /**
+     * Offset within the log meta data which the page size is stored.
+     */
+    public static final int LOG_PAGE_SIZE_OFFSET;
 
     /**
      * Offset at which the default frame headers begin.
@@ -112,30 +133,6 @@ public class LogBufferDescriptor
      * Maximum length of a frame header.
      */
     public static final int LOG_DEFAULT_FRAME_HEADER_MAX_LENGTH = CACHE_LINE_LENGTH * 2;
-
-    static
-    {
-        int offset = 0;
-        TERM_TAIL_COUNTERS_OFFSET = offset;
-
-        offset += (SIZE_OF_LONG * PARTITION_COUNT);
-        LOG_ACTIVE_PARTITION_INDEX_OFFSET = offset;
-
-        offset = (CACHE_LINE_LENGTH * 2);
-        LOG_TIME_OF_LAST_SM_OFFSET = offset;
-        LOG_END_OF_STREAM_POSITION_OFFSET = LOG_TIME_OF_LAST_SM_OFFSET + SIZE_OF_LONG;
-
-        offset += (CACHE_LINE_LENGTH * 2);
-        LOG_CORRELATION_ID_OFFSET = offset;
-        LOG_INITIAL_TERM_ID_OFFSET = LOG_CORRELATION_ID_OFFSET + SIZE_OF_LONG;
-        LOG_DEFAULT_FRAME_HEADER_LENGTH_OFFSET = LOG_INITIAL_TERM_ID_OFFSET + SIZE_OF_INT;
-        LOG_MTU_LENGTH_OFFSET = LOG_DEFAULT_FRAME_HEADER_LENGTH_OFFSET + SIZE_OF_INT;
-
-        offset += CACHE_LINE_LENGTH;
-        LOG_DEFAULT_FRAME_HEADER_OFFSET = offset;
-
-        LOG_META_DATA_LENGTH = offset + LOG_DEFAULT_FRAME_HEADER_MAX_LENGTH;
-    }
 
     /**
      * Total length of the log meta data buffer in bytes.
@@ -152,16 +149,15 @@ public class LogBufferDescriptor
      *  |                       Tail Counter 2                          |
      *  |                                                               |
      *  +---------------------------------------------------------------+
-     *  |                   Active Partition Index                      |
+     *  |                      Active Term Count                        |
      *  +---------------------------------------------------------------+
-     *  |                      Cache Line Padding                      ...
+     *  |                     Cache Line Padding                       ...
      * ...                                                              |
-     *  +---------------------------------------------------------------+
-     *  |                 Time of Last Status Message                   |
-     *  |                                                               |
      *  +---------------------------------------------------------------+
      *  |                    End of Stream Position                     |
      *  |                                                               |
+     *  +---------------------------------------------------------------+
+     *  |                        Is Connected                           |
      *  +---------------------------------------------------------------+
      *  |                      Cache Line Padding                      ...
      * ...                                                              |
@@ -175,15 +171,45 @@ public class LogBufferDescriptor
      *  +---------------------------------------------------------------+
      *  |                          MTU Length                           |
      *  +---------------------------------------------------------------+
+     *  |                         Term Length                           |
+     *  +---------------------------------------------------------------+
+     *  |                          Page Size                            |
+     *  +---------------------------------------------------------------+
      *  |                      Cache Line Padding                      ...
      * ...                                                              |
      *  +---------------------------------------------------------------+
-     *  |                    Default Frame Header                      ...
+     *  |                     Default Frame Header                     ...
      * ...                                                              |
      *  +---------------------------------------------------------------+
      * </pre>
      */
     public static final int LOG_META_DATA_LENGTH;
+
+    static
+    {
+        int offset = 0;
+        TERM_TAIL_COUNTERS_OFFSET = offset;
+
+        offset += (SIZE_OF_LONG * PARTITION_COUNT);
+        LOG_ACTIVE_TERM_COUNT_OFFSET = offset;
+
+        offset = (CACHE_LINE_LENGTH * 2);
+        LOG_END_OF_STREAM_POSITION_OFFSET = offset;
+        LOG_IS_CONNECTED_OFFSET = LOG_END_OF_STREAM_POSITION_OFFSET + SIZE_OF_LONG;
+
+        offset += (CACHE_LINE_LENGTH * 2);
+        LOG_CORRELATION_ID_OFFSET = offset;
+        LOG_INITIAL_TERM_ID_OFFSET = LOG_CORRELATION_ID_OFFSET + SIZE_OF_LONG;
+        LOG_DEFAULT_FRAME_HEADER_LENGTH_OFFSET = LOG_INITIAL_TERM_ID_OFFSET + SIZE_OF_INT;
+        LOG_MTU_LENGTH_OFFSET = LOG_DEFAULT_FRAME_HEADER_LENGTH_OFFSET + SIZE_OF_INT;
+        LOG_TERM_LENGTH_OFFSET = LOG_MTU_LENGTH_OFFSET + SIZE_OF_INT;
+        LOG_PAGE_SIZE_OFFSET = LOG_TERM_LENGTH_OFFSET + SIZE_OF_INT;
+
+        offset += CACHE_LINE_LENGTH;
+        LOG_DEFAULT_FRAME_HEADER_OFFSET = offset;
+
+        LOG_META_DATA_LENGTH = align(offset + LOG_DEFAULT_FRAME_HEADER_MAX_LENGTH, PAGE_MIN_SIZE);
+    }
 
     /**
      * Check that term length is valid and alignment is valid.
@@ -208,6 +234,32 @@ public class LogBufferDescriptor
         if (!BitUtil.isPowerOfTwo(termLength))
         {
             throw new IllegalStateException("Term length not a power of 2: length=" + termLength);
+        }
+    }
+
+    /**
+     * Check that page size is valid and alignment is valid.
+     *
+     * @param pageSize to be checked.
+     * @throws IllegalStateException if the size is not as expected.
+     */
+    public static void checkPageSize(final int pageSize)
+    {
+        if (pageSize < PAGE_MIN_SIZE)
+        {
+            throw new IllegalStateException(
+                "Page size less than min size of " + PAGE_MIN_SIZE + ": page size=" + pageSize);
+        }
+
+        if (pageSize > PAGE_MAX_SIZE)
+        {
+            throw new IllegalStateException(
+                "Page size more than max size of " + PAGE_MAX_SIZE + ": page size=" + pageSize);
+        }
+
+        if (!BitUtil.isPowerOfTwo(pageSize))
+        {
+            throw new IllegalStateException("Page size not a power of 2: page size=" + pageSize);
         }
     }
 
@@ -257,6 +309,50 @@ public class LogBufferDescriptor
     }
 
     /**
+     * Get the value of the Term Length used for this log.
+     *
+     * @param logMetaDataBuffer containing the meta data.
+     * @return the value of the term length used for this log.
+     */
+    public static int termLength(final UnsafeBuffer logMetaDataBuffer)
+    {
+        return logMetaDataBuffer.getInt(LOG_TERM_LENGTH_OFFSET);
+    }
+
+    /**
+     * Set the term length used for this log.
+     *
+     * @param logMetaDataBuffer containing the meta data.
+     * @param termLength        value to be set.
+     */
+    public static void termLength(final UnsafeBuffer logMetaDataBuffer, final int termLength)
+    {
+        logMetaDataBuffer.putInt(LOG_TERM_LENGTH_OFFSET, termLength);
+    }
+
+    /**
+     * Get the value of the page size used for this log.
+     *
+     * @param logMetaDataBuffer containing the meta data.
+     * @return the value of the page size used for this log.
+     */
+    public static int pageSize(final UnsafeBuffer logMetaDataBuffer)
+    {
+        return logMetaDataBuffer.getInt(LOG_PAGE_SIZE_OFFSET);
+    }
+
+    /**
+     * Set the page size used for this log.
+     *
+     * @param logMetaDataBuffer containing the meta data.
+     * @param pageSize          value to be set.
+     */
+    public static void pageSize(final UnsafeBuffer logMetaDataBuffer, final int pageSize)
+    {
+        logMetaDataBuffer.putInt(LOG_PAGE_SIZE_OFFSET, pageSize);
+    }
+
+    /**
      * Get the value of the correlation ID for this log relating to the command which created it.
      *
      * @param logMetaDataBuffer containing the meta data.
@@ -279,25 +375,25 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get the value of the time of last SM in {@link System#currentTimeMillis()}.
+     * Get whether the log is considered connected or not by the driver.
      *
      * @param logMetaDataBuffer containing the meta data.
-     * @return the value of time of last SM
+     * @return whether the log is considered connected or not by the driver.
      */
-    public static long timeOfLastStatusMessage(final UnsafeBuffer logMetaDataBuffer)
+    public static boolean isConnected(final UnsafeBuffer logMetaDataBuffer)
     {
-        return logMetaDataBuffer.getLongVolatile(LOG_TIME_OF_LAST_SM_OFFSET);
+        return logMetaDataBuffer.getIntVolatile(LOG_IS_CONNECTED_OFFSET) == 1;
     }
 
     /**
-     * Set the value of the time of last SM used by the producer of this log.
+     * Set whether the log is considered connected or not by the driver.
      *
      * @param logMetaDataBuffer containing the meta data.
-     * @param timeInMillis      value of the time of last SM in {@link System#currentTimeMillis()}
+     * @param isConnected       or not
      */
-    public static void timeOfLastStatusMessage(final UnsafeBuffer logMetaDataBuffer, final long timeInMillis)
+    public static void isConnected(final UnsafeBuffer logMetaDataBuffer, final boolean isConnected)
     {
-        logMetaDataBuffer.putLongOrdered(LOG_TIME_OF_LAST_SM_OFFSET, timeInMillis);
+        logMetaDataBuffer.putIntOrdered(LOG_IS_CONNECTED_OFFSET, isConnected ? 1 : 0);
     }
 
     /**
@@ -323,37 +419,51 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get the value of the active partition index used by the producer of this log. Consumers may have a different
-     * active index if they are running behind. The read is done with volatile semantics.
+     * Get the value of the active term count used by the producer of this log. Consumers may have a different
+     * active term count if they are running behind. The read is done with volatile semantics.
      *
      * @param logMetaDataBuffer containing the meta data.
-     * @return the value of the active partition index used by the producer of this log.
+     * @return the value of the active term count used by the producer of this log.
      */
-    public static int activePartitionIndex(final UnsafeBuffer logMetaDataBuffer)
+    public static int activeTermCount(final UnsafeBuffer logMetaDataBuffer)
     {
-        return logMetaDataBuffer.getIntVolatile(LOG_ACTIVE_PARTITION_INDEX_OFFSET);
+        return logMetaDataBuffer.getIntVolatile(LOG_ACTIVE_TERM_COUNT_OFFSET);
     }
 
     /**
-     * Set the value of the current active partition index for the producer using memory ordered semantics.
+     * Set the value of the current active term count for the producer using memory ordered semantics.
      *
-     * @param logMetaDataBuffer    containing the meta data.
-     * @param activePartitionIndex value of the active partition index used by the producer of this log.
+     * @param logMetaDataBuffer containing the meta data.
+     * @param termCount         value of the active term count used by the producer of this log.
      */
-    public static void activePartitionIndexOrdered(final UnsafeBuffer logMetaDataBuffer, final int activePartitionIndex)
+    public static void activeTermCountOrdered(final UnsafeBuffer logMetaDataBuffer, final int termCount)
     {
-        logMetaDataBuffer.putIntOrdered(LOG_ACTIVE_PARTITION_INDEX_OFFSET, activePartitionIndex);
+        logMetaDataBuffer.putIntOrdered(LOG_ACTIVE_TERM_COUNT_OFFSET, termCount);
+    }
+
+    /**
+     * Compare and set the value of the current active term count.
+     *
+     * @param logMetaDataBuffer containing the meta data.
+     * @param expectedTermCount value of the active term count expected in the log
+     * @param updateTermCount   value of the active term count to be updated in the log
+     * @return true if successful otherwise false.
+     */
+    public static boolean casActiveTermCount(
+        final UnsafeBuffer logMetaDataBuffer, final int expectedTermCount, final int updateTermCount)
+    {
+        return logMetaDataBuffer.compareAndSetInt(LOG_ACTIVE_TERM_COUNT_OFFSET, expectedTermCount, updateTermCount);
     }
 
     /**
      * Set the value of the current active partition index for the producer.
      *
-     * @param logMetaDataBuffer    containing the meta data.
-     * @param activePartitionIndex value of the active partition index used by the producer of this log.
+     * @param logMetaDataBuffer containing the meta data.
+     * @param termCount         value of the active term count used by the producer of this log.
      */
-    public static void activePartitionIndex(final UnsafeBuffer logMetaDataBuffer, final int activePartitionIndex)
+    public static void activeTermCount(final UnsafeBuffer logMetaDataBuffer, final int termCount)
     {
-        logMetaDataBuffer.putInt(LOG_ACTIVE_PARTITION_INDEX_OFFSET, activePartitionIndex);
+        logMetaDataBuffer.putInt(LOG_ACTIVE_TERM_COUNT_OFFSET, termCount);
     }
 
     /**
@@ -420,6 +530,19 @@ public class LogBufferDescriptor
     }
 
     /**
+     * Compute the current position in absolute number of bytes.
+     *
+     * @param termCount           of terms since the initial term.
+     * @param termOffset          in the term.
+     * @param positionBitsToShift number of times to left shift the term count
+     * @return the absolute position in bytes
+     */
+    public static long computePosition(final int termCount, final int termOffset, final int positionBitsToShift)
+    {
+        return (termCount << positionBitsToShift) + termOffset;
+    }
+
+    /**
      * Compute the current position in absolute number of bytes for the beginning of a term.
      *
      * @param activeTermId        active term id.
@@ -466,23 +589,20 @@ public class LogBufferDescriptor
     /**
      * Compute the total length of a log file given the term length.
      *
+     * Assumes TERM_MAX_LENGTH is 1GB and that filePageSize is 1GB or less and a power of 2.
+     *
      * @param termLength on which to base the calculation.
+     * @param filePageSize to use for log.
      * @return the total length of the log file.
      */
-    public static long computeLogLength(final int termLength)
+    public static long computeLogLength(final int termLength, final int filePageSize)
     {
-        return (termLength * PARTITION_COUNT) + LOG_META_DATA_LENGTH;
-    }
+        if (termLength < (1024 * 1024 * 1024))
+        {
+            return align((termLength * PARTITION_COUNT) + LOG_META_DATA_LENGTH, filePageSize);
+        }
 
-    /**
-     * Compute the term length based on the total length of the log.
-     *
-     * @param logLength the total length of the log.
-     * @return length of an individual term buffer in the log.
-     */
-    public static int computeTermLength(final long logLength)
-    {
-        return (int)((logLength - LOG_META_DATA_LENGTH) / PARTITION_COUNT);
+        return (PARTITION_COUNT * termLength) + align(LOG_META_DATA_LENGTH, filePageSize);
     }
 
     /**
@@ -497,7 +617,7 @@ public class LogBufferDescriptor
         if (defaultHeader.capacity() != HEADER_LENGTH)
         {
             throw new IllegalArgumentException(
-                "Default header of not equals to HEADER_LENGTH: length=" + defaultHeader.capacity());
+                "Default header length not equal to HEADER_LENGTH: length=" + defaultHeader.capacity());
         }
 
         logMetaDataBuffer.putInt(LOG_DEFAULT_FRAME_HEADER_LENGTH_OFFSET, HEADER_LENGTH);
@@ -529,17 +649,35 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Rotate the log and update the default headers for the new term.
+     * Rotate the log and update the tail counter for the new term.
      *
-     * @param logMetaDataBuffer    for the meta data.
-     * @param activePartitionIndex current active index.
-     * @param termId               to be used in the default headers.
+     * This method is safe for concurrent use.
+     *
+     * @param logMetaDataBuffer for the meta data.
+     * @param currentTermCount  from which to rotate.
+     * @param currentTermId     to be used in the default headers.
+     * @return true if log was rotated.
      */
-    public static void rotateLog(final UnsafeBuffer logMetaDataBuffer, final int activePartitionIndex, final int termId)
+    public static boolean rotateLog(
+        final UnsafeBuffer logMetaDataBuffer, final int currentTermCount, final int currentTermId)
     {
-        final int nextIndex = nextPartitionIndex(activePartitionIndex);
-        initialiseTailWithTermId(logMetaDataBuffer, nextIndex, termId);
-        activePartitionIndexOrdered(logMetaDataBuffer, nextIndex);
+        final int nextTermId = currentTermId + 1;
+        final int nextTermCount = currentTermCount + 1;
+        final int nextIndex = indexByTermCount(nextTermCount);
+        final int expectedTermId = nextTermId - PARTITION_COUNT;
+
+        long rawTail;
+        do
+        {
+            rawTail = rawTail(logMetaDataBuffer, nextIndex);
+            if (expectedTermId != termId(rawTail))
+            {
+                break;
+            }
+        }
+        while (!casRawTail(logMetaDataBuffer, nextIndex, rawTail, packTail(nextTermId, 0)));
+
+        return casActiveTermCount(logMetaDataBuffer, currentTermCount, nextTermCount);
     }
 
     /**
@@ -661,7 +799,70 @@ public class LogBufferDescriptor
      */
     public static long rawTailVolatile(final UnsafeBuffer logMetaDataBuffer)
     {
-        final int partitionIndex = activePartitionIndex(logMetaDataBuffer);
+        final int partitionIndex = indexByTermCount(activeTermCount(logMetaDataBuffer));
         return logMetaDataBuffer.getLongVolatile(TERM_TAIL_COUNTERS_OFFSET + (SIZE_OF_LONG * partitionIndex));
+    }
+
+    /**
+     * Compare and set the raw value of the tail for the given partition.
+     *
+     * @param logMetaDataBuffer containing the tail counters.
+     * @param partitionIndex    for the tail counter.
+     * @param expectedRawTail   expected current value.
+     * @param updateRawTail     to be applied.
+     * @return true if the update was successful otherwise false.
+     */
+    public static boolean casRawTail(
+        final UnsafeBuffer logMetaDataBuffer,
+        final int partitionIndex,
+        final long expectedRawTail,
+        final long updateRawTail)
+    {
+        final int index = TERM_TAIL_COUNTERS_OFFSET + (SIZE_OF_LONG * partitionIndex);
+        return logMetaDataBuffer.compareAndSetLong(index, expectedRawTail, updateRawTail);
+    }
+
+    /**
+     * Get the number of bits to shift when dividing or multiplying by the term buffer length.
+     *
+     * @param termBufferLength to compute the number of bits to shift for.
+     * @return the number of bits to shift to divide or multiply by the term buffer length.
+     */
+    public static int positionBitsToShift(final int termBufferLength)
+    {
+        switch (termBufferLength)
+        {
+            case 64 * 1024: return 16;
+
+            case 128 * 1024: return 17;
+
+            case 256 * 1024: return 18;
+
+            case 512 * 1024: return 19;
+
+            case 1024 * 1024: return 20;
+
+            case 2 * 1024 * 1024: return 21;
+
+            case 4 * 1024 * 1024: return 22;
+
+            case 8 * 1024 * 1024: return 23;
+
+            case 16 * 1024 * 1024: return 24;
+
+            case 32 * 1024 * 1024: return 25;
+
+            case 64 * 1024 * 1024: return 26;
+
+            case 128 * 1024 * 1024: return 27;
+
+            case 256 * 1024 * 1024: return 28;
+
+            case 512 * 1024 * 1024: return 29;
+
+            case 1024 * 1024 * 1024: return 30;
+        }
+
+        throw new IllegalArgumentException("Invalid term buffer length: " + termBufferLength);
     }
 }

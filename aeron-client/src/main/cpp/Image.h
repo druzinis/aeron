@@ -19,6 +19,7 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/LogBufferDescriptor.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <concurrent/logbuffer/Header.h>
 #include <concurrent/logbuffer/TermReader.h>
 #include <concurrent/logbuffer/TermBlockScanner.h>
@@ -34,8 +35,6 @@ using namespace aeron::concurrent::logbuffer;
 using namespace aeron::concurrent::status;
 
 static UnsafeBufferPosition NULL_POSITION;
-
-static const int IMAGE_CLOSED = -1;
 
 enum class ControlledPollAction : int
 {
@@ -133,8 +132,10 @@ public:
         const util::index_t capacity = m_termBuffers[0].capacity();
 
         m_joinPosition = subscriberPosition.get();
+        m_finalPosition = m_joinPosition;
         m_termLengthMask = capacity - 1;
         m_positionBitsToShift = BitUtil::numberOfTrailingZeroes(capacity);
+        m_isEos = false;
     }
 
     Image(const Image& image) :
@@ -153,9 +154,12 @@ public:
         m_logBuffers = image.m_logBuffers;
         m_correlationId = image.m_correlationId;
         m_subscriptionRegistrationId = image.m_subscriptionRegistrationId;
+        m_joinPosition = image.m_joinPosition;
+        m_finalPosition = image.m_finalPosition;
         m_sessionId = image.m_sessionId;
         m_termLengthMask = image.m_termLengthMask;
         m_positionBitsToShift = image.m_positionBitsToShift;
+        m_isEos = image.m_isEos;
     }
 
     Image& operator=(Image& image)
@@ -173,9 +177,12 @@ public:
         m_exceptionHandler = image.m_exceptionHandler;
         m_correlationId = image.m_correlationId;
         m_subscriptionRegistrationId = image.m_subscriptionRegistrationId;
+        m_joinPosition = image.m_joinPosition;
+        m_finalPosition = image.m_finalPosition;
         m_sessionId = image.m_sessionId;
         m_termLengthMask = image.m_termLengthMask;
         m_positionBitsToShift = image.m_positionBitsToShift;
+        m_isEos = image.m_isEos;
         return *this;
     }
 
@@ -194,9 +201,12 @@ public:
         m_exceptionHandler = image.m_exceptionHandler;
         m_correlationId = image.m_correlationId;
         m_subscriptionRegistrationId = image.m_subscriptionRegistrationId;
+        m_joinPosition = image.m_joinPosition;
+        m_finalPosition = image.m_finalPosition;
         m_sessionId = image.m_sessionId;
         m_termLengthMask = image.m_termLengthMask;
         m_positionBitsToShift = image.m_positionBitsToShift;
+        m_isEos = image.m_isEos;
         return *this;
     }
 
@@ -279,7 +289,7 @@ public:
      */
     inline bool isClosed() const
     {
-        return std::atomic_load_explicit(&m_isClosed, std::memory_order_relaxed);
+        return std::atomic_load_explicit(&m_isClosed, std::memory_order_acquire);
     }
 
     /**
@@ -289,14 +299,45 @@ public:
      */
     inline std::int64_t position()
     {
-        std::int64_t result = IMAGE_CLOSED;
-
-        if (!isClosed())
+        if (isClosed())
         {
-            result = m_subscriberPosition.get();
+            return m_finalPosition;
         }
 
-        return result;
+        return m_subscriberPosition.get();
+    }
+
+    /**
+     * Set the subscriber position for this Image to indicate where it has been consumed to.
+     *
+     * @param newPosition for the consumption point.
+     */
+    inline void position(std::int64_t newPosition)
+    {
+        if (isClosed())
+        {
+            throw util::IllegalStateException("Image is closed", SOURCEINFO);
+        }
+
+        validatePosition(newPosition);
+        m_subscriberPosition.setOrdered(newPosition);
+    }
+
+    /**
+     * Is the current consumed position at the end of the stream?
+     *
+     * @return true if at the end of the stream or false if not.
+     */
+    inline bool isEndOfStream()
+    {
+        if (isClosed())
+        {
+            return m_isEos;
+        }
+
+        return m_subscriberPosition.get() >=
+            LogBufferDescriptor::endOfStreamPosition(m_logBuffers->atomicBuffer(
+                LogBufferDescriptor::LOG_META_DATA_SECTION_INDEX));
     }
 
     /**
@@ -312,7 +353,7 @@ public:
     template <typename F>
     inline int poll(F&& fragmentHandler, int fragmentLimit)
     {
-        int result = IMAGE_CLOSED;
+        int result = 0;
 
         if (!isClosed())
         {
@@ -351,21 +392,216 @@ public:
     template <typename F>
     inline int controlledPoll(F&& fragmentHandler, int fragmentLimit)
     {
-        int result = IMAGE_CLOSED;
+        int result = 0;
 
         if (!isClosed())
         {
-            std::int64_t position = m_subscriberPosition.get();
-            std::int32_t termOffset = (std::int32_t) position & m_termLengthMask;
-            AtomicBuffer &termBuffer = m_termBuffers[LogBufferDescriptor::indexByPosition(position,
-                m_positionBitsToShift)];
             int fragmentsRead = 0;
-            std::int32_t offset = termOffset;
+            std::int64_t initialPosition = m_subscriberPosition.get();
+            std::int32_t initialOffset = (std::int32_t) initialPosition & m_termLengthMask;
+            AtomicBuffer &termBuffer = m_termBuffers[LogBufferDescriptor::indexByPosition(initialPosition,
+                m_positionBitsToShift)];
+            std::int32_t resultingOffset = initialOffset;
+            const util::index_t capacity = termBuffer.capacity();
+
+            m_header.buffer(termBuffer);
 
             try
             {
-                const util::index_t capacity = termBuffer.capacity();
+                do
+                {
+                    const std::int32_t length = FrameDescriptor::frameLengthVolatile(termBuffer, resultingOffset);
+                    if (length <= 0)
+                    {
+                        break;
+                    }
 
+                    const std::int32_t frameOffset = resultingOffset;
+                    const std::int32_t alignedLength = util::BitUtil::align(length, FrameDescriptor::FRAME_ALIGNMENT);
+                    resultingOffset += alignedLength;
+
+                    if (FrameDescriptor::isPaddingFrame(termBuffer, frameOffset))
+                    {
+                        continue;
+                    }
+
+                    m_header.offset(frameOffset);
+
+                    const ControlledPollAction action =
+                        fragmentHandler(
+                            termBuffer,
+                            frameOffset + DataFrameHeader::LENGTH,
+                            length - DataFrameHeader::LENGTH,
+                            m_header);
+
+                    if (ControlledPollAction::ABORT == action)
+                    {
+                        resultingOffset -= alignedLength;
+                        break;
+                    }
+
+                    ++fragmentsRead;
+
+                    if (ControlledPollAction::BREAK == action)
+                    {
+                        break;
+                    }
+                    else if (ControlledPollAction::COMMIT == action)
+                    {
+                        initialPosition += (resultingOffset - initialOffset);
+                        initialOffset = resultingOffset;
+                        m_subscriberPosition.setOrdered(initialPosition);
+                    }
+                }
+                while (fragmentsRead < fragmentLimit && resultingOffset < capacity);
+            }
+            catch (const std::exception& ex)
+            {
+                m_exceptionHandler(ex);
+            }
+
+            const std::int64_t resultingPosition = initialPosition + (resultingOffset - initialOffset);
+            if (resultingPosition > initialPosition)
+            {
+                m_subscriberPosition.setOrdered(resultingPosition);
+            }
+
+            result = fragmentsRead;
+        }
+
+        return result;
+    }
+
+    /**
+     * Poll for new messages in a stream. If new messages are found beyond the last consumed position then they
+     * will be delivered to the controlled_poll_fragment_handler_t up to a limited number of fragments as specified or
+     * the maximum position specified.
+     *
+     * To assemble messages that span multiple fragments then use ControlledFragmentAssembler.
+     *
+     * @param fragmentHandler to which message fragments are delivered.
+     * @param maxPosition     to consume messages up to.
+     * @param fragmentLimit   for the number of fragments to be consumed during one polling operation.
+     * @return the number of fragments that have been consumed.
+     * @see controlled_poll_fragment_handler_t
+     */
+    template <typename F>
+    inline int boundedControlledPoll(F&& fragmentHandler, std::int64_t maxPosition, int fragmentLimit)
+    {
+        int result = 0;
+
+        if (!isClosed())
+        {
+            int fragmentsRead = 0;
+            std::int64_t initialPosition = m_subscriberPosition.get();
+            std::int32_t initialOffset = (std::int32_t) initialPosition & m_termLengthMask;
+            AtomicBuffer &termBuffer = m_termBuffers[LogBufferDescriptor::indexByPosition(initialPosition,
+                m_positionBitsToShift)];
+            std::int32_t resultingOffset = initialOffset;
+            const util::index_t capacity = termBuffer.capacity();
+            std::int32_t endOffset =
+                std::min(capacity, static_cast<std::int32_t>(maxPosition - initialPosition + initialOffset));
+
+            m_header.buffer(termBuffer);
+
+            try
+            {
+                while (fragmentsRead < fragmentLimit && resultingOffset < endOffset)
+                {
+                    const std::int32_t length = FrameDescriptor::frameLengthVolatile(termBuffer, resultingOffset);
+                    if (length <= 0)
+                    {
+                        break;
+                    }
+
+                    const std::int32_t frameOffset = resultingOffset;
+                    const std::int32_t alignedLength = util::BitUtil::align(length, FrameDescriptor::FRAME_ALIGNMENT);
+                    resultingOffset += alignedLength;
+
+                    if (FrameDescriptor::isPaddingFrame(termBuffer, frameOffset))
+                    {
+                        continue;
+                    }
+
+                    m_header.offset(frameOffset);
+
+                    const ControlledPollAction action =
+                        fragmentHandler(
+                            termBuffer,
+                            frameOffset + DataFrameHeader::LENGTH,
+                            length - DataFrameHeader::LENGTH,
+                            m_header);
+
+                    if (ControlledPollAction::ABORT == action)
+                    {
+                        resultingOffset -= alignedLength;
+                        break;
+                    }
+
+                    ++fragmentsRead;
+
+                    if (ControlledPollAction::BREAK == action)
+                    {
+                        break;
+                    }
+                    else if (ControlledPollAction::COMMIT == action)
+                    {
+                        initialPosition += (resultingOffset - initialOffset);
+                        initialOffset = resultingOffset;
+                        m_subscriberPosition.setOrdered(initialPosition);
+                    }
+                }
+            }
+            catch (const std::exception& ex)
+            {
+                m_exceptionHandler(ex);
+            }
+
+            const std::int64_t resultingPosition = initialPosition + (resultingOffset - initialOffset);
+            if (resultingPosition > initialPosition)
+            {
+                m_subscriberPosition.setOrdered(resultingPosition);
+            }
+
+            result = fragmentsRead;
+        }
+
+        return result;
+    }
+
+    /**
+     * Peek for new messages in a stream by scanning forward from an initial position. If new messages are found then
+     * they will be delivered to the controlled_poll_fragment_handler_t up to a limited position.
+     * <p>
+     * To assemble messages that span multiple fragments then use ControlledFragmentAssembler. Scans must also
+     * start at the beginning of a message so that the assembler is reset.
+     *
+     * @param initialPosition from which to peek forward.
+     * @param fragmentHandler to which message fragments are delivered.
+     * @param limitPosition   up to which can be scanned.
+     * @return the resulting position after the scan terminates which is a complete message.
+     * @see controlled_poll_fragment_handler_t
+     */
+    template <typename F>
+    inline std::int64_t controlledPeek(std::int64_t initialPosition, F&& fragmentHandler, std::int64_t limitPosition)
+    {
+        std::int64_t resultingPosition = initialPosition;
+
+        if (!isClosed())
+        {
+            validatePosition(initialPosition);
+
+            std::int32_t initialOffset = static_cast<std::int32_t>(initialPosition & m_termLengthMask);
+            std::int32_t offset = initialOffset;
+            std::int64_t position = initialPosition;
+            AtomicBuffer &termBuffer = m_termBuffers[LogBufferDescriptor::indexByPosition(initialPosition,
+                m_positionBitsToShift)];
+            const util::index_t capacity = termBuffer.capacity();
+
+            m_header.buffer(termBuffer);
+
+            try
+            {
                 do
                 {
                     const std::int32_t length = FrameDescriptor::frameLengthVolatile(termBuffer, offset);
@@ -378,55 +614,47 @@ public:
                     const std::int32_t alignedLength = util::BitUtil::align(length, FrameDescriptor::FRAME_ALIGNMENT);
                     offset += alignedLength;
 
-                    if (!FrameDescriptor::isPaddingFrame(termBuffer, frameOffset))
+                    if (FrameDescriptor::isPaddingFrame(termBuffer, frameOffset))
                     {
-                        m_header.buffer(termBuffer);
-                        m_header.offset(frameOffset);
+                        continue;
+                    }
 
-                        const ControlledPollAction action =
-                            fragmentHandler(
-                                termBuffer,
-                                frameOffset + DataFrameHeader::LENGTH,
-                                length - DataFrameHeader::LENGTH,
-                                m_header);
+                    m_header.offset(frameOffset);
 
-                        ++fragmentsRead;
+                    const ControlledPollAction action =
+                        fragmentHandler(
+                            termBuffer,
+                            frameOffset + DataFrameHeader::LENGTH,
+                            length - DataFrameHeader::LENGTH,
+                            m_header);
 
-                        if (ControlledPollAction::BREAK == action)
-                        {
-                            break;
-                        }
-                        else if (ControlledPollAction::ABORT == action)
-                        {
-                            --fragmentsRead;
-                            offset = frameOffset;
-                            break;
-                        }
-                        else if (ControlledPollAction::COMMIT == action)
-                        {
-                            position += alignedLength;
-                            termOffset = offset;
-                            m_subscriberPosition.setOrdered(position);
-                        }
+                    if (ControlledPollAction::ABORT == action)
+                    {
+                        break;
+                    }
+
+                    position += (offset - initialOffset);
+                    initialOffset = offset;
+
+                    if (m_header.flags() & FrameDescriptor::END_FRAG)
+                    {
+                        resultingPosition = position;
+                    }
+
+                    if (ControlledPollAction::BREAK == action)
+                    {
+                        break;
                     }
                 }
-                while (fragmentsRead < fragmentLimit && offset < capacity);
+                while (position < limitPosition && offset < capacity);
             }
             catch (const std::exception& ex)
             {
                 m_exceptionHandler(ex);
             }
-
-            const std::int64_t newPosition = position + (offset - termOffset);
-            if (newPosition > position)
-            {
-                m_subscriberPosition.setOrdered(newPosition);
-            }
-
-            result = fragmentsRead;
         }
 
-        return result;
+        return resultingPosition;
     }
 
     /**
@@ -442,7 +670,7 @@ public:
     template <typename F>
     inline int blockPoll(F&& blockHandler, int blockLengthLimit)
     {
-        int result = IMAGE_CLOSED;
+        int result = 0;
 
         if (!isClosed())
         {
@@ -478,8 +706,6 @@ public:
         return result;
     }
 
-    // TODO: filePoll() with fd/HANDLE (or MemoryMappedFile) ptr access
-
     std::shared_ptr<LogBuffers> logBuffers()
     {
         return m_logBuffers;
@@ -488,7 +714,10 @@ public:
     /// @cond HIDDEN_SYMBOLS
     inline void close()
     {
-        std::atomic_store_explicit(&m_isClosed, true, std::memory_order_relaxed);
+        m_finalPosition = m_subscriberPosition.getVolatile();
+        m_isEos = m_finalPosition >= LogBufferDescriptor::endOfStreamPosition(
+                m_logBuffers->atomicBuffer(LogBufferDescriptor::LOG_META_DATA_SECTION_INDEX));
+        std::atomic_store_explicit(&m_isClosed, true, std::memory_order_release);
     }
     /// @endcond
 
@@ -504,9 +733,43 @@ private:
     std::int64_t m_correlationId;
     std::int64_t m_subscriptionRegistrationId;
     std::int64_t m_joinPosition;
+    std::int64_t m_finalPosition;
     std::int32_t m_sessionId;
     std::int32_t m_termLengthMask;
     std::int32_t m_positionBitsToShift;
+    bool m_isEos;
+
+    void validatePosition(std::int64_t newPosition)
+    {
+        const std::int64_t currentPosition = m_subscriberPosition.get();
+        const std::int64_t limitPosition = currentPosition + termBufferLength();
+
+        if (newPosition < currentPosition || newPosition > limitPosition)
+        {
+            throw util::IllegalArgumentException(
+                util::strPrintf("newPosition of %d out of range %d - %d", newPosition, currentPosition, limitPosition),
+                SOURCEINFO);
+        }
+
+        if (0 != (newPosition & (FrameDescriptor::FRAME_ALIGNMENT - 1)))
+        {
+            throw util::IllegalArgumentException(
+                util::strPrintf("newPosition of %d not aligned to FRAME_ALIGNMENT", newPosition),
+                SOURCEINFO);
+        }
+    }
+};
+
+struct ImageList
+{
+    Image *m_images;
+    std::size_t m_length;
+
+    ImageList(Image *images, std::size_t length) :
+        m_images(images),
+        m_length(length)
+    {
+    }
 };
 
 }

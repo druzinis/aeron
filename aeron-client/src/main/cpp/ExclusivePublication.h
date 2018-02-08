@@ -23,6 +23,7 @@
 #include <concurrent/logbuffer/ExclusiveBufferClaim.h>
 #include <concurrent/logbuffer/ExclusiveTermAppender.h>
 #include <concurrent/status/UnsafeBufferPosition.h>
+#include "concurrent/status/StatusIndicatorReader.h"
 #include "Publication.h"
 #include "LogBuffers.h"
 
@@ -42,7 +43,7 @@ using namespace aeron::concurrent::status;
  *
  * The APIs used try claim and offer are non-blocking.
  *
- * <b>Note:</b> ExclusivePublication instances are NOT threadsafe for offer and try claim method but are for position.
+ * <b>Note:</b> ExclusivePublication instances are NOT threadsafe for offer and try claim methods but are for others.
  *
  * @see Aeron#addExclusivePublication(String, int)
  * @see ExclusiveBufferClaim
@@ -56,10 +57,11 @@ public:
         ClientConductor& conductor,
         const std::string& channel,
         std::int64_t registrationId,
-        std::int64_t correlationId,
+        std::int64_t originalRegistrationId,
         std::int32_t streamId,
         std::int32_t sessionId,
         UnsafeBufferPosition& publicationLimit,
+        StatusIndicatorReader& channelStatusIndicator,
         std::shared_ptr<LogBuffers> buffers);
     /// @endcond
 
@@ -176,7 +178,7 @@ public:
      */
     inline bool isConnected() const
     {
-        return !isClosed() && isPublicationConnected(LogBufferDescriptor::timeOfLastStatusMessage(m_logMetaDataBuffer));
+        return !isClosed() && LogBufferDescriptor::isConnected(m_logMetaDataBuffer);
     }
 
     /**
@@ -186,7 +188,7 @@ public:
      */
     inline bool isClosed() const
     {
-        return std::atomic_load_explicit(&m_isClosed, std::memory_order_relaxed);
+        return std::atomic_load_explicit(&m_isClosed, std::memory_order_acquire);
     }
 
     /**
@@ -230,6 +232,16 @@ public:
     }
 
     /**
+     * Get the status indicator assigned to the channel of this {@link Publication}
+     *
+     * @return status indicator reader for the channel
+     */
+    inline StatusIndicatorReader& channelStatusIndicator()
+    {
+        return m_channelStatusIndicator;
+    }
+
+    /**
      * Non-blocking publish of a buffer containing a message.
      *
      * @param buffer containing message.
@@ -259,24 +271,33 @@ public:
                 if (length <= m_maxPayloadLength)
                 {
                     result = termAppender->appendUnfragmentedMessage(
-                        m_termId, m_termOffset, m_headerWriter, buffer, offset, length, reservedValueSupplier);
+                        m_termId,
+                        m_termOffset,
+                        m_headerWriter,
+                        buffer,
+                        offset,
+                        length,
+                        reservedValueSupplier);
                 }
                 else
                 {
                     checkForMaxMessageLength(length);
                     result = termAppender->appendFragmentedMessage(
-                        m_termId, m_termOffset, m_headerWriter, buffer, offset, length, m_maxPayloadLength, reservedValueSupplier);
+                        m_termId,
+                        m_termOffset,
+                        m_headerWriter,
+                        buffer,
+                        offset,
+                        length,
+                        m_maxPayloadLength,
+                        reservedValueSupplier);
                 }
 
                 newPosition = ExclusivePublication::newPosition(result);
             }
-            else if (isPublicationConnected(LogBufferDescriptor::timeOfLastStatusMessage(m_logMetaDataBuffer)))
-            {
-                newPosition = BACK_PRESSURED;
-            }
             else
             {
-                newPosition = NOT_CONNECTED;
+                newPosition = ExclusivePublication::backPressureStatus(position, length);
             }
         }
 
@@ -306,6 +327,113 @@ public:
     inline std::int64_t offer(concurrent::AtomicBuffer& buffer)
     {
         return offer(buffer, 0, buffer.capacity());
+    }
+
+    /**
+     * Non-blocking publish of buffers containing a message.
+     *
+     * @param startBuffer containing part of the message.
+     * @param lastBuffer after the message.
+     * @param reservedValueSupplier for the frame.
+     * @return The new stream position, otherwise {@link #NOT_CONNECTED}, {@link #BACK_PRESSURED},
+     * {@link #ADMIN_ACTION} or {@link #CLOSED}.
+     */
+    template <class BufferIterator> std::int64_t offer(
+        BufferIterator startBuffer,
+        BufferIterator lastBuffer,
+        const on_reserved_value_supplier_t& reservedValueSupplier = DEFAULT_RESERVED_VALUE_SUPPLIER)
+    {
+        util::index_t length = 0;
+        for (BufferIterator it = startBuffer; it != lastBuffer; ++it)
+        {
+            if (AERON_COND_EXPECT(length + it->capacity() < 0, false))
+            {
+                throw aeron::util::IllegalStateException(
+                    aeron::util::strPrintf("length overflow: %d + %d -> %d",
+                        length,
+                        it->capacity(),
+                        length + it->capacity()),
+                    SOURCEINFO);
+            }
+
+            length += it->capacity();
+        }
+
+        std::int64_t newPosition = PUBLICATION_CLOSED;
+
+        if (!isClosed())
+        {
+            const std::int64_t limit = m_publicationLimit.getVolatile();
+            ExclusiveTermAppender *termAppender = m_appenders[m_activePartitionIndex].get();
+            const std::int64_t position = m_termBeginPosition + m_termOffset;
+
+            if (position < limit)
+            {
+                std::int32_t result;
+                if (length <= m_maxPayloadLength)
+                {
+                    result = termAppender->appendUnfragmentedMessage(
+                        m_termId,
+                        m_termOffset,
+                        m_headerWriter,
+                        startBuffer,
+                        length,
+                        reservedValueSupplier);
+                }
+                else
+                {
+                    checkForMaxMessageLength(length);
+                    result = termAppender->appendFragmentedMessage(
+                        m_termId,
+                        m_termOffset,
+                        m_headerWriter,
+                        startBuffer,
+                        length,
+                        m_maxPayloadLength,
+                        reservedValueSupplier);
+                }
+
+                newPosition = ExclusivePublication::newPosition(result);
+            }
+            else
+            {
+                newPosition = ExclusivePublication::backPressureStatus(position, length);
+            }
+        }
+
+        return newPosition;
+    }
+
+    /**
+     * Non-blocking publish of array of buffers containing a message.
+     *
+     * @param buffers containing parts of the message.
+     * @param length of the array of buffers.
+     * @param reservedValueSupplier for the frame.
+     * @return The new stream position, otherwise {@link #NOT_CONNECTED}, {@link #BACK_PRESSURED},
+     * {@link #ADMIN_ACTION} or {@link #CLOSED}.
+     */
+    std::int64_t offer(
+        const concurrent::AtomicBuffer buffers[],
+        size_t length,
+        const on_reserved_value_supplier_t& reservedValueSupplier = DEFAULT_RESERVED_VALUE_SUPPLIER)
+    {
+        return offer(buffers, buffers + length, reservedValueSupplier);
+    }
+
+    /**
+     * Non-blocking publish of array of buffers containing a message.
+     *
+     * @param buffers containing parts of the message.
+     * @param reservedValueSupplier for the frame.
+     * @return The new stream position, otherwise {@link #NOT_CONNECTED}, {@link #BACK_PRESSURED},
+     * {@link #ADMIN_ACTION} or {@link #CLOSED}.
+     */
+    template <size_t N> std::int64_t offer(
+        const std::array<concurrent::AtomicBuffer, N>& buffers,
+        const on_reserved_value_supplier_t& reservedValueSupplier = DEFAULT_RESERVED_VALUE_SUPPLIER)
+    {
+        return offer(buffers.begin(), buffers.end(), reservedValueSupplier);
     }
 
     /**
@@ -340,30 +468,26 @@ public:
      * @throws IllegalArgumentException if the length is greater than max payload length within an MTU.
      * @see BufferClaim::commit
      */
-    inline std::int64_t tryClaim(util::index_t length, concurrent::logbuffer::ExclusiveBufferClaim& bufferClaim)
+    inline std::int64_t tryClaim(util::index_t length, concurrent::logbuffer::BufferClaim& bufferClaim)
     {
+        checkForMaxPayloadLength(length);
         std::int64_t newPosition = PUBLICATION_CLOSED;
 
         if (AERON_COND_EXPECT((!isClosed()), true))
         {
-            checkForMaxPayloadLength(length);
-
             const std::int64_t limit = m_publicationLimit.getVolatile();
             ExclusiveTermAppender *termAppender = m_appenders[m_activePartitionIndex].get();
             const std::int64_t position = m_termBeginPosition + m_termOffset;
 
             if (AERON_COND_EXPECT((position < limit), true))
             {
-                const std::int32_t result = termAppender->claim(m_termId, m_termOffset, m_headerWriter, length, bufferClaim);
+                const std::int32_t result =
+                    termAppender->claim(m_termId, m_termOffset, m_headerWriter, length, bufferClaim);
                 newPosition = ExclusivePublication::newPosition(result);
-            }
-            else if (isPublicationConnected(LogBufferDescriptor::timeOfLastStatusMessage(m_logMetaDataBuffer)))
-            {
-                newPosition = BACK_PRESSURED;
             }
             else
             {
-                newPosition = NOT_CONNECTED;
+                newPosition = ExclusivePublication::backPressureStatus(position, length);
             }
         }
 
@@ -387,7 +511,7 @@ public:
     /// @cond HIDDEN_SYMBOLS
     inline void close()
     {
-        std::atomic_store_explicit(&m_isClosed, true, std::memory_order_relaxed);
+        std::atomic_store_explicit(&m_isClosed, true, std::memory_order_release);
     }
     /// @endcond
 
@@ -398,6 +522,7 @@ private:
     const std::string m_channel;
     std::int64_t m_registrationId;
     std::int64_t m_originalRegistrationId;
+    std::int64_t m_maxPossiblePosition;
     std::int32_t m_streamId;
     std::int32_t m_sessionId;
     std::int32_t m_initialTermId;
@@ -411,6 +536,7 @@ private:
     std::int32_t m_termOffset;
 
     ReadablePosition<UnsafeBufferPosition> m_publicationLimit;
+    StatusIndicatorReader m_channelStatusIndicator;
     std::atomic<bool> m_isClosed = { false };
 
     std::shared_ptr<LogBuffers> m_logbuffers;
@@ -425,21 +551,42 @@ private:
 
             return m_termBeginPosition + resultingOffset;
         }
-        else
+
+        if ((m_termBeginPosition + termBufferLength()) >= m_maxPossiblePosition)
         {
-            const int nextIndex = LogBufferDescriptor::nextPartitionIndex(m_activePartitionIndex);
-            const std::int32_t nextTermId = m_termId + 1;
-
-            m_activePartitionIndex = nextIndex;
-            m_termOffset = 0;
-            m_termId = nextTermId;
-            m_termBeginPosition = LogBufferDescriptor::computeTermBeginPosition(nextTermId, m_positionBitsToShift, m_initialTermId);
-
-            m_appenders[nextIndex]->tailTermId(nextTermId);
-            LogBufferDescriptor::activePartitionIndex(m_logMetaDataBuffer, nextIndex);
-
-            return ADMIN_ACTION;
+            return MAX_POSITION_EXCEEDED;
         }
+
+        const int nextIndex = LogBufferDescriptor::nextPartitionIndex(m_activePartitionIndex);
+        const std::int32_t nextTermId = m_termId + 1;
+
+        m_activePartitionIndex = nextIndex;
+        m_termOffset = 0;
+        m_termId = nextTermId;
+        m_termBeginPosition =
+            LogBufferDescriptor::computeTermBeginPosition(nextTermId, m_positionBitsToShift, m_initialTermId);
+
+        const std::int32_t termCount = nextTermId - m_initialTermId;
+
+        LogBufferDescriptor::initializeTailWithTermId(m_logMetaDataBuffer, nextIndex, nextTermId);
+        LogBufferDescriptor::activeTermCountOrdered(m_logMetaDataBuffer, termCount);
+
+        return ADMIN_ACTION;
+    }
+
+    inline std::int64_t backPressureStatus(std::int64_t currentPosition, std::int32_t messageLength)
+    {
+        if ((currentPosition + messageLength) >= m_maxPossiblePosition)
+        {
+            return MAX_POSITION_EXCEEDED;
+        }
+
+        if (LogBufferDescriptor::isConnected(m_logMetaDataBuffer))
+        {
+            return BACK_PRESSURED;
+        }
+
+        return NOT_CONNECTED;
     }
 
     inline void checkForMaxMessageLength(const util::index_t length) const
@@ -462,7 +609,6 @@ private:
         }
     }
 
-    bool isPublicationConnected(std::int64_t timeOfLastStatusMessage) const;
 };
 
 }

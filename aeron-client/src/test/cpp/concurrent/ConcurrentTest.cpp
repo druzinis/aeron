@@ -48,35 +48,35 @@ TEST (atomicBufferTests, checkBounds)
     });
 
     ASSERT_NO_THROW({
-        ab.putInt32(testBuffer.size() - sizeof(std::int32_t), -1);
+        ab.putInt32(convertSizeToIndex(testBuffer.size() - sizeof(std::int32_t)), -1);
     });
 
     ASSERT_NO_THROW({
-        ab.putInt64(testBuffer.size() - sizeof(std::int64_t), -1);
+        ab.putInt64(convertSizeToIndex(testBuffer.size() - sizeof(std::int64_t)), -1);
     });
 
     ASSERT_NO_THROW({
-        ab.putStringUtf8(testBuffer.size() - testString.length() - sizeof(std::int32_t), testString);
+        ab.putString(convertSizeToIndex(testBuffer.size() - testString.length() - sizeof(std::int32_t)), testString);
     });
 
     ASSERT_THROW({
-        ab.putInt32(testBuffer.size(), -1);
+        ab.putInt32(convertSizeToIndex(testBuffer.size()), -1);
     }, OutOfBoundsException);
 
     ASSERT_THROW({
-        ab.putInt64(testBuffer.size(), -1);
+        ab.putInt64(convertSizeToIndex(testBuffer.size()), -1);
     }, OutOfBoundsException);
 
     ASSERT_THROW({
-        ab.putInt32(testBuffer.size() - sizeof(std::int32_t) + 1, -1);
+        ab.putInt32(convertSizeToIndex(testBuffer.size() - sizeof(std::int32_t) + 1), -1);
     }, OutOfBoundsException);
 
     ASSERT_THROW({
-        ab.putInt64(testBuffer.size() - sizeof(std::int64_t) + 1, -1);
+        ab.putInt64(convertSizeToIndex(testBuffer.size() - sizeof(std::int64_t) + 1), -1);
     }, OutOfBoundsException);
 
     ASSERT_THROW({
-        ab.putStringUtf8(testBuffer.size() - testString.length() - sizeof(std::int32_t) + 1, testString);
+        ab.putString(convertSizeToIndex(testBuffer.size() - testString.length() - sizeof(std::int32_t) + 1), testString);
     }, OutOfBoundsException);
 }
 #endif
@@ -87,7 +87,7 @@ TEST (atomicBufferTests, stringStore)
     AtomicBuffer ab(&testBuffer[0], testBuffer.size());
     std::string testString("hello world!");
 
-    ab.putStringUtf8(256, testString);
+    ab.putString(256, testString);
 
     ASSERT_EQ((size_t)ab.getInt32(256), testString.length());
 
@@ -102,9 +102,9 @@ TEST (atomicBufferTests, stringRead)
     AtomicBuffer ab(&testBuffer[0], testBuffer.size());
     std::string testString("hello world!");
 
-    ab.putStringUtf8(256, testString);
+    ab.putString(256, testString);
 
-    std::string result = ab.getStringUtf8(256);
+    std::string result = ab.getString(256);
 
     ASSERT_EQ(testString, result);
 }

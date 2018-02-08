@@ -44,7 +44,7 @@ public class Pong
     private static final String PONG_CHANNEL = SampleConfiguration.PONG_CHANNEL;
     private static final IdleStrategy PING_HANDLER_IDLE_STRATEGY = new BusySpinIdleStrategy();
 
-    public static void main(final String[] args) throws Exception
+    public static void main(final String[] args)
     {
         final MediaDriver driver = EMBEDDED_MEDIA_DRIVER ? MediaDriver.launchEmbedded() : null;
 
@@ -69,8 +69,8 @@ public class Pong
         SigInt.register(() -> running.set(false));
 
         try (Aeron aeron = Aeron.connect(ctx);
-             Publication pongPublication = aeron.addPublication(PONG_CHANNEL, PONG_STREAM_ID);
-             Subscription pingSubscription = aeron.addSubscription(PING_CHANNEL, PING_STREAM_ID))
+            Publication pongPublication = aeron.addPublication(PONG_CHANNEL, PONG_STREAM_ID);
+            Subscription pingSubscription = aeron.addSubscription(PING_CHANNEL, PING_STREAM_ID))
         {
             final FragmentAssembler dataHandler = new FragmentAssembler(
                 (buffer, offset, length, header) -> pingHandler(pongPublication, buffer, offset, length));

@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 import static org.agrona.BitUtil.CACHE_LINE_LENGTH;
+import static org.agrona.SystemUtil.loadPropertiesFiles;
 import static org.agrona.UnsafeAccess.UNSAFE;
 
 public class EmbeddedIpcThroughput
@@ -38,7 +39,7 @@ public class EmbeddedIpcThroughput
 
     public static void main(final String[] args) throws Exception
     {
-        MediaDriver.loadPropertiesFiles(args);
+        loadPropertiesFiles(args);
 
         final AtomicBoolean running = new AtomicBoolean(true);
         SigInt.register(() -> running.set(false));
@@ -48,9 +49,9 @@ public class EmbeddedIpcThroughput
             .sharedIdleStrategy(new NoOpIdleStrategy());
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
         {
             final Subscriber subscriber = new Subscriber(running, subscription);
             final Thread subscriberThread = new Thread(subscriber);
@@ -97,7 +98,7 @@ public class EmbeddedIpcThroughput
                 final long bytesTransferred = newTotalBytes - lastTotalBytes;
 
                 System.out.format(
-                    "Duration %dms - %,d messages - %,d bytes%n",
+                    "Duration %dms - %,d messages - %,d payload bytes%n",
                     duration, bytesTransferred / MESSAGE_LENGTH, bytesTransferred);
 
                 lastTimeStamp = newTimeStamp;
@@ -183,12 +184,12 @@ public class EmbeddedIpcThroughput
 
         public void run()
         {
-            while (subscription.hasNoImages())
+            while (!subscription.isConnected())
             {
                 Thread.yield();
             }
 
-            final Image image = subscription.getImage(0);
+            final Image image = subscription.imageAtIndex(0);
 
             long failedPolls = 0;
             long successfulPolls = 0;

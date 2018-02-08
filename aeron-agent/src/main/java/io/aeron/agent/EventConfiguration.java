@@ -15,6 +15,7 @@
  */
 package io.aeron.agent;
 
+import org.agrona.SystemUtil;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.ringbuffer.ManyToOneRingBuffer;
 import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
@@ -40,7 +41,7 @@ public class EventConfiguration
      * <ul>
      * <li>A comma separated list of EventCodes to enable</li>
      * <li>"all" which enables all the codes</li>
-     * <li>"admin" which enables the codes specified by {@link #ADMIN_ONLY_EVENT_CODES}</li>
+     * <li>"admin" which enables the codes specified by {@link #ADMIN_ONLY_EVENT_CODES} which is the admin commands</li>
      * </ul>
      */
     public static final String ENABLED_EVENT_CODES_PROP_NAME = "aeron.event.log";
@@ -51,6 +52,9 @@ public class EventConfiguration
         CMD_IN_KEEPALIVE_CLIENT,
         CMD_IN_REMOVE_PUBLICATION,
         CMD_IN_REMOVE_SUBSCRIPTION,
+        CMD_IN_ADD_COUNTER,
+        CMD_IN_REMOVE_COUNTER,
+        CMD_IN_CLIENT_CLOSE,
         REMOVE_IMAGE_CLEANUP,
         REMOVE_PUBLICATION_CLEANUP,
         REMOVE_SUBSCRIPTION_CLEANUP,
@@ -58,6 +62,10 @@ public class EventConfiguration
         CMD_OUT_AVAILABLE_IMAGE,
         CMD_OUT_ON_UNAVAILABLE_IMAGE,
         CMD_OUT_ON_OPERATION_SUCCESS,
+        CMD_OUT_ERROR,
+        CMD_OUT_SUBSCRIPTION_READY,
+        CMD_OUT_COUNTER_READY,
+        CMD_OUT_ON_UNAVAILABLE_COUNTER,
         SEND_CHANNEL_CREATION,
         RECEIVE_CHANNEL_CREATION,
         SEND_CHANNEL_CLOSE,
@@ -96,10 +104,9 @@ public class EventConfiguration
     {
         ENABLED_EVENT_CODES = makeTagBitSet(getEnabledEventCodes(System.getProperty(ENABLED_EVENT_CODES_PROP_NAME)));
 
-        final int bufferLength =
-            Integer.getInteger(
-                EventConfiguration.BUFFER_LENGTH_PROP_NAME,
-                EventConfiguration.BUFFER_LENGTH_DEFAULT) + RingBufferDescriptor.TRAILER_LENGTH;
+        final int bufferLength = SystemUtil.getSizeAsInt(
+            EventConfiguration.BUFFER_LENGTH_PROP_NAME, EventConfiguration.BUFFER_LENGTH_DEFAULT) +
+            RingBufferDescriptor.TRAILER_LENGTH;
 
         EVENT_RING_BUFFER = new ManyToOneRingBuffer(new UnsafeBuffer(ByteBuffer.allocateDirect(bufferLength)));
     }
@@ -111,11 +118,14 @@ public class EventConfiguration
 
     static long makeTagBitSet(final Set<EventCode> eventCodes)
     {
-        return
-            eventCodes
-                .stream()
-                .mapToLong(EventCode::tagBit)
-                .reduce(0L, (acc, x) -> acc | x);
+        long result = 0;
+
+        for (final EventCode eventCode : eventCodes)
+        {
+            result |= eventCode.tagBit();
+        }
+
+        return result;
     }
 
     /**

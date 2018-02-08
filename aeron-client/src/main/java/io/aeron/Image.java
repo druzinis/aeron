@@ -48,11 +48,12 @@ public class Image
 {
     private final long correlationId;
     private final long joinPosition;
+    private long finalPosition;
     private final int sessionId;
     private final int initialTermId;
     private final int termLengthMask;
     private final int positionBitsToShift;
-    private volatile boolean isEos;
+    private boolean isEos;
     private volatile boolean isClosed;
 
     private final Position subscriberPosition;
@@ -92,11 +93,11 @@ public class Image
         this.correlationId = correlationId;
         this.joinPosition = subscriberPosition.get();
 
-        termBuffers = logBuffers.termBuffers();
+        termBuffers = logBuffers.duplicateTermBuffers();
 
         final int termLength = logBuffers.termLength();
         this.termLengthMask = termLength - 1;
-        this.positionBitsToShift = Integer.numberOfTrailingZeros(termLength);
+        this.positionBitsToShift = LogBufferDescriptor.positionBitsToShift(termLength);
         this.initialTermId = LogBufferDescriptor.initialTermId(logBuffers.metaDataBuffer());
         header = new Header(initialTermId, positionBitsToShift, this);
     }
@@ -112,7 +113,8 @@ public class Image
     }
 
     /**
-     * The sessionId for the steam of messages.
+     * The sessionId for the steam of messages. Sessions are unique within a {@link Subscription} and unique across
+     * all {@link Publication}s from a {@link #sourceIdentity()}.
      *
      * @return the sessionId for the steam of messages.
      */
@@ -152,9 +154,9 @@ public class Image
     }
 
     /**
-     * The originalRegistrationId for identification of the image with the media driver.
+     * The correlationId for identification of the image with the media driver.
      *
-     * @return the originalRegistrationId for identification of the image with the media driver.
+     * @return the correlationId for identification of the image with the media driver.
      */
     public long correlationId()
     {
@@ -200,7 +202,7 @@ public class Image
     {
         if (isClosed)
         {
-            return 0;
+            return finalPosition;
         }
 
         return subscriberPosition.get();
@@ -221,6 +223,16 @@ public class Image
         validatePosition(newPosition);
 
         subscriberPosition.setOrdered(newPosition);
+    }
+
+    /**
+     * The counter id for the subscriber position counter.
+     *
+     * @return the id for the subscriber position counter.
+     */
+    public int subscriberPositionId()
+    {
+        return subscriberPosition.id();
     }
 
     /**
@@ -354,6 +366,99 @@ public class Image
                 }
             }
             while (fragmentsRead < fragmentLimit && resultingOffset < capacity);
+        }
+        catch (final Throwable t)
+        {
+            errorHandler.onError(t);
+        }
+        finally
+        {
+            final long resultingPosition = initialPosition + (resultingOffset - initialOffset);
+            if (resultingPosition > initialPosition)
+            {
+                subscriberPosition.setOrdered(resultingPosition);
+            }
+        }
+
+        return fragmentsRead;
+    }
+
+    /**
+     * Poll for new messages in a stream. If new messages are found beyond the last consumed position then they
+     * will be delivered to the {@link ControlledFragmentHandler} up to a limited number of fragments as specified or
+     * the maximum position specified.
+     * <p>
+     * Use a {@link ControlledFragmentAssembler} to assemble messages which span multiple fragments.
+     *
+     * @param fragmentHandler to which message fragments are delivered.
+     * @param maxPosition     to consume messages up to.
+     * @param fragmentLimit   for the number of fragments to be consumed during one polling operation.
+     * @return the number of fragments that have been consumed.
+     * @see ControlledFragmentAssembler
+     * @see ImageControlledFragmentAssembler
+     */
+    public int boundedControlledPoll(
+        final ControlledFragmentHandler fragmentHandler, final long maxPosition, final int fragmentLimit)
+    {
+        if (isClosed)
+        {
+            return 0;
+        }
+
+        int fragmentsRead = 0;
+        long initialPosition = subscriberPosition.get();
+        int initialOffset = (int)initialPosition & termLengthMask;
+        int resultingOffset = initialOffset;
+        final UnsafeBuffer termBuffer = activeTermBuffer(initialPosition);
+        final int endOffset = Math.min(termBuffer.capacity(), (int)(maxPosition - initialPosition + initialOffset));
+        header.buffer(termBuffer);
+
+        try
+        {
+            while (fragmentsRead < fragmentLimit && resultingOffset < endOffset)
+            {
+                final int length = frameLengthVolatile(termBuffer, resultingOffset);
+                if (length <= 0)
+                {
+                    break;
+                }
+
+                final int frameOffset = resultingOffset;
+                final int alignedLength = BitUtil.align(length, FRAME_ALIGNMENT);
+                resultingOffset += alignedLength;
+
+                if (isPaddingFrame(termBuffer, frameOffset))
+                {
+                    continue;
+                }
+
+                header.offset(frameOffset);
+
+                final Action action = fragmentHandler.onFragment(
+                    termBuffer,
+                    frameOffset + HEADER_LENGTH,
+                    length - HEADER_LENGTH,
+                    header);
+
+                if (action == ABORT)
+                {
+                    resultingOffset -= alignedLength;
+                    break;
+                }
+
+                ++fragmentsRead;
+
+                if (action == BREAK)
+                {
+                    break;
+                }
+                else if (action == COMMIT)
+                {
+                    initialPosition += (resultingOffset - initialOffset);
+                    initialOffset = resultingOffset;
+                    subscriberPosition.setOrdered(initialPosition);
+                }
+            }
         }
         catch (final Throwable t)
         {
@@ -573,31 +678,15 @@ public class Image
         }
     }
 
-    ManagedResource managedResource()
+    LogBuffers logBuffers()
     {
-        isEos = subscriberPosition.getVolatile() >= endOfStreamPosition(logBuffers.metaDataBuffer());
-        isClosed = true;
-
-        return new ImageManagedResource();
+        return logBuffers;
     }
 
-    private class ImageManagedResource implements ManagedResource
+    void close()
     {
-        private long timeOfLastStateChange = 0;
-
-        public void timeOfLastStateChange(final long time)
-        {
-            this.timeOfLastStateChange = time;
-        }
-
-        public long timeOfLastStateChange()
-        {
-            return timeOfLastStateChange;
-        }
-
-        public void delete()
-        {
-            logBuffers.close();
-        }
+        finalPosition = subscriberPosition.getVolatile();
+        isEos = finalPosition >= endOfStreamPosition(logBuffers.metaDataBuffer());
+        isClosed = true;
     }
 }

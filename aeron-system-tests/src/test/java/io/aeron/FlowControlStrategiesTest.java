@@ -21,6 +21,7 @@ import io.aeron.logbuffer.Header;
 import io.aeron.protocol.DataHeaderFlyweight;
 import org.agrona.DirectBuffer;
 import org.agrona.IoUtil;
+import org.agrona.collections.MutableInteger;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.YieldingIdleStrategy;
 import org.junit.After;
@@ -30,7 +31,6 @@ import java.io.File;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.mockito.Mockito.*;
 
@@ -52,8 +52,6 @@ public class FlowControlStrategiesTest
 
     private final MediaDriver.Context driverAContext = new MediaDriver.Context();
     private final MediaDriver.Context driverBContext = new MediaDriver.Context();
-    private final Aeron.Context aeronAContext = new Aeron.Context();
-    private final Aeron.Context aeronBContext = new Aeron.Context();
 
     private Aeron clientA;
     private Aeron clientB;
@@ -76,31 +74,25 @@ public class FlowControlStrategiesTest
 
         driverAContext.publicationTermBufferLength(TERM_BUFFER_LENGTH)
             .aeronDirectoryName(baseDirA)
+            .errorHandler(Throwable::printStackTrace)
             .sharedIdleStrategy(new YieldingIdleStrategy())
             .threadingMode(ThreadingMode.SHARED);
-
-        aeronAContext.aeronDirectoryName(driverAContext.aeronDirectoryName());
 
         driverBContext.publicationTermBufferLength(TERM_BUFFER_LENGTH)
             .aeronDirectoryName(baseDirB)
+            .errorHandler(Throwable::printStackTrace)
             .sharedIdleStrategy(new YieldingIdleStrategy())
             .threadingMode(ThreadingMode.SHARED);
 
-        aeronBContext.aeronDirectoryName(driverBContext.aeronDirectoryName());
-
         driverA = MediaDriver.launch(driverAContext);
         driverB = MediaDriver.launch(driverBContext);
-        clientA = Aeron.connect(aeronAContext);
-        clientB = Aeron.connect(aeronBContext);
+        clientA = Aeron.connect(new Aeron.Context().aeronDirectoryName(driverAContext.aeronDirectoryName()));
+        clientB = Aeron.connect(new Aeron.Context().aeronDirectoryName(driverBContext.aeronDirectoryName()));
     }
 
     @After
-    public void closeEverything()
+    public void after()
     {
-        publication.close();
-        subscriptionA.close();
-        subscriptionB.close();
-
         clientB.close();
         clientA.close();
         driverB.close();
@@ -118,7 +110,7 @@ public class FlowControlStrategiesTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.sleep(1);
         }
@@ -135,17 +127,17 @@ public class FlowControlStrategiesTest
         driverAContext.multicastFlowControlSupplier(
             (udpChannel, streamId, registrationId) -> new MaxMulticastFlowControl());
 
-        aeronAContext.availableImageHandler(mock(AvailableImageHandler.class));
-        aeronBContext.availableImageHandler((image) -> availableCountDownLatch.countDown());
-        aeronBContext.unavailableImageHandler((image) -> unavailableCountDownLatch.countDown());
-
         launch();
 
         publication = clientA.addPublication(MULTICAST_URI, STREAM_ID);
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
-        subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
+        subscriptionB = clientB.addSubscription(
+            MULTICAST_URI,
+            STREAM_ID,
+            (image) -> availableCountDownLatch.countDown(),
+            (image) -> unavailableCountDownLatch.countDown());
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.yield();
         }
@@ -158,12 +150,12 @@ public class FlowControlStrategiesTest
             }
 
             // A keeps up
-            final AtomicInteger fragmentsRead = new AtomicInteger();
+            final MutableInteger fragmentsRead = new MutableInteger();
             SystemTestHelper.executeUntil(
                 () -> fragmentsRead.get() > 0,
                 (j) ->
                 {
-                    fragmentsRead.addAndGet(subscriptionA.poll(fragmentHandlerA, 10));
+                    fragmentsRead.value += subscriptionA.poll(fragmentHandlerA, 10);
                     Thread.yield();
                 },
                 Integer.MAX_VALUE,
@@ -178,7 +170,7 @@ public class FlowControlStrategiesTest
                     () -> fragmentsRead.get() > 0,
                     (j) ->
                     {
-                        fragmentsRead.addAndGet(subscriptionB.poll(fragmentHandlerB, 1));
+                        fragmentsRead.value += subscriptionB.poll(fragmentHandlerB, 1);
                         Thread.yield();
                     },
                     Integer.MAX_VALUE,
@@ -203,7 +195,7 @@ public class FlowControlStrategiesTest
     }
 
     @Test(timeout = 10000)
-    public void shouldSlowDownWhenBehindWithMinMulticastFlowControlStrategy() throws Exception
+    public void shouldSlowDownWhenBehindWithMinMulticastFlowControlStrategy()
     {
         final int numMessagesToSend = NUM_MESSAGES_PER_TERM * 3;
         int numMessagesLeftToSend = numMessagesToSend;
@@ -220,7 +212,7 @@ public class FlowControlStrategiesTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.yield();
         }
@@ -261,7 +253,7 @@ public class FlowControlStrategiesTest
     }
 
     @Test(timeout = 10000)
-    public void shouldRemoveDeadReceiverWithMinMulticastFlowControlStrategy() throws Exception
+    public void shouldRemoveDeadReceiverWithMinMulticastFlowControlStrategy()
     {
         final int numMessagesToSend = NUM_MESSAGES_PER_TERM * 3;
         int numMessagesLeftToSend = numMessagesToSend;
@@ -279,7 +271,7 @@ public class FlowControlStrategiesTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.yield();
         }
@@ -317,7 +309,7 @@ public class FlowControlStrategiesTest
     }
 
     @Test(timeout = 10000)
-    public void shouldSlowDownToSlowPreferredWithPreferredMulticastFlowControlStrategy() throws Exception
+    public void shouldSlowDownToSlowPreferredWithPreferredMulticastFlowControlStrategy()
     {
         final int numMessagesToSend = NUM_MESSAGES_PER_TERM * 3;
         int numMessagesLeftToSend = numMessagesToSend;
@@ -335,7 +327,7 @@ public class FlowControlStrategiesTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.yield();
         }
@@ -376,7 +368,7 @@ public class FlowControlStrategiesTest
     }
 
     @Test(timeout = 10000)
-    public void shouldKeepUpToFastPreferredWithPreferredMulticastFlowControlStrategy() throws Exception
+    public void shouldKeepUpToFastPreferredWithPreferredMulticastFlowControlStrategy()
     {
         final int numMessagesToSend = NUM_MESSAGES_PER_TERM * 3;
         int numMessagesLeftToSend = numMessagesToSend;
@@ -393,12 +385,11 @@ public class FlowControlStrategiesTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.yield();
         }
 
-        int numFragmentsFromB = 0;
         for (long i = 0; numFragmentsFromA < numMessagesToSend; i++)
         {
             if (numMessagesLeftToSend > 0)
@@ -417,7 +408,7 @@ public class FlowControlStrategiesTest
             // B receives slowly
             if ((i % 2) == 0)
             {
-                numFragmentsFromB += subscriptionB.poll(fragmentHandlerB, 1);
+                subscriptionB.poll(fragmentHandlerB, 1);
             }
         }
 
@@ -435,7 +426,7 @@ public class FlowControlStrategiesTest
     }
 
     @Test(timeout = 10000)
-    public void shouldRemoveDeadPreferredReceiverWithPreferredMulticastFlowControlStrategy() throws Exception
+    public void shouldRemoveDeadPreferredReceiverWithPreferredMulticastFlowControlStrategy()
     {
         final int numMessagesToSend = NUM_MESSAGES_PER_TERM * 3;
         int numMessagesLeftToSend = numMessagesToSend;
@@ -453,7 +444,7 @@ public class FlowControlStrategiesTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() || subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() || !subscriptionB.isConnected())
         {
             Thread.yield();
         }

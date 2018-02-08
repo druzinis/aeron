@@ -16,6 +16,7 @@
 package io.aeron.samples;
 
 import static io.aeron.samples.SamplesUtil.rateReporterHandler;
+import static org.agrona.SystemUtil.loadPropertiesFiles;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -50,20 +51,17 @@ public class EmbeddedThroughput
 
     public static void main(final String[] args) throws Exception
     {
-        MediaDriver.loadPropertiesFiles(args);
+        loadPropertiesFiles(args);
 
         final RateReporter reporter = new RateReporter(TimeUnit.SECONDS.toNanos(1), EmbeddedThroughput::printRate);
         final FragmentHandler rateReporterHandler = rateReporterHandler(reporter);
         final ExecutorService executor = Executors.newFixedThreadPool(2);
-
-        final Aeron.Context context = new Aeron.Context();
-
         final AtomicBoolean running = new AtomicBoolean(true);
 
         try (MediaDriver ignore = MediaDriver.launch();
-             Aeron aeron = Aeron.connect(context);
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
         {
             executor.execute(reporter);
             executor.execute(() -> SamplesUtil.subscriberLoop(
@@ -74,7 +72,7 @@ public class EmbeddedThroughput
             do
             {
                 System.out.format(
-                    "%nStreaming %,d messages of size %d bytes to %s on stream Id %d%n",
+                    "%nStreaming %,d messages of payload length %d bytes to %s on stream Id %d%n",
                     NUMBER_OF_MESSAGES, MESSAGE_LENGTH, CHANNEL, STREAM_ID);
 
                 printingActive = true;
@@ -95,14 +93,13 @@ public class EmbeddedThroughput
                 System.out.println(
                     "Done streaming. backPressureRatio=" + ((double)backPressureCount / NUMBER_OF_MESSAGES));
 
-                if (0 < LINGER_TIMEOUT_MS)
+                if (LINGER_TIMEOUT_MS > 0)
                 {
                     System.out.println("Lingering for " + LINGER_TIMEOUT_MS + " milliseconds...");
                     Thread.sleep(LINGER_TIMEOUT_MS);
                 }
 
                 printingActive = false;
-
             }
             while (barrier.await());
 
@@ -118,7 +115,7 @@ public class EmbeddedThroughput
         if (printingActive)
         {
             System.out.format(
-                "%.02g msgs/sec, %.02g bytes/sec, totals %d messages %d MB%n",
+                "%.02g msgs/sec, %.02g bytes/sec, totals %d messages %d MB payloads%n",
                 messagesPerSec, bytesPerSec, totalFragments, totalBytes / (1024 * 1024));
         }
     }

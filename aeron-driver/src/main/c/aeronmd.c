@@ -14,33 +14,39 @@
  * limitations under the License.
  */
 
+#if defined(__linux__)
+#define _BSD_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <stdlib.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <time.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include "aeronmd.h"
+#include "concurrent/aeron_atomic.h"
 
-static atomic_bool running;
+volatile bool running = true;
 
 void sigint_handler(int signal)
 {
-    atomic_store(&running, false);
+    AERON_PUT_ORDERED(running, false);
 }
 
-/**
- *  $ $0 <file and URL list>
- */
+inline bool is_running()
+{
+    bool result;
+    AERON_GET_VOLATILE(result, running);
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     int status = EXIT_FAILURE;
     aeron_driver_context_t *context = NULL;
     aeron_driver_t *driver = NULL;
 
-    atomic_init(&running, true);
     signal(SIGINT, sigint_handler);
 
     if (aeron_driver_context_init(&context) < 0)
@@ -61,7 +67,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    while (atomic_load(&running))
+    while (is_running())
     {
         aeron_driver_main_idle_strategy(driver, aeron_driver_main_do_work(driver));
     }
@@ -75,3 +81,5 @@ int main(int argc, char **argv)
 
     return status;
 }
+
+extern bool is_running();

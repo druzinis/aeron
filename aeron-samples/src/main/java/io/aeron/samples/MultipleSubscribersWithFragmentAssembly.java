@@ -42,7 +42,7 @@ public class MultipleSubscribersWithFragmentAssembly
 
     private static final String CHANNEL = SampleConfiguration.CHANNEL;
 
-    public static void main(final String[] args) throws Exception
+    public static void main(final String[] args)
     {
         System.out.format("Subscribing to %s on stream ID %d and stream ID %d%n",
             CHANNEL, STREAM_ID_1, STREAM_ID_2);
@@ -58,8 +58,8 @@ public class MultipleSubscribersWithFragmentAssembly
         SigInt.register(() -> running.set(false));
 
         try (Aeron aeron = Aeron.connect(ctx);
-             Subscription subscription1 = aeron.addSubscription(CHANNEL, STREAM_ID_1);
-             Subscription subscription2 = aeron.addSubscription(CHANNEL, STREAM_ID_2))
+            Subscription subscription1 = aeron.addSubscription(CHANNEL, STREAM_ID_1);
+            Subscription subscription2 = aeron.addSubscription(CHANNEL, STREAM_ID_2))
         {
             final IdleStrategy idleStrategy = new BackoffIdleStrategy(
                 100, 10, TimeUnit.MICROSECONDS.toNanos(1), TimeUnit.MICROSECONDS.toNanos(100));
@@ -116,28 +116,26 @@ public class MultipleSubscribersWithFragmentAssembly
      *
      * @param streamId to show when printing
      * @return subscription data handler function that prints the message contents
-     * @throws Exception if an error occurs
      */
-    public static FragmentHandler reassembledStringMessage1(final int streamId) throws Exception
+    public static FragmentHandler reassembledStringMessage1(final int streamId)
     {
-        return
-            (buffer, offset, length, header) ->
+        return (buffer, offset, length, header) ->
+        {
+            final byte[] data = new byte[length];
+            buffer.getBytes(offset, data);
+
+            System.out.format(
+                "message to stream %d from session %x term id %x term offset %d (%d@%d)%n",
+                streamId, header.sessionId(), header.termId(), header.termOffset(), length, offset);
+
+            if (length != 10000)
             {
-                final byte[] data = new byte[length];
-                buffer.getBytes(offset, data);
-
                 System.out.format(
-                    "message to stream %d from session %x term id %x term offset %d (%d@%d)%n",
-                    streamId, header.sessionId(), header.termId(), header.termOffset(), length, offset);
-
-                if (length != 10000)
-                {
-                    System.out.format(
-                        "Received message was not assembled properly;" +
-                        " received length was %d, but was expecting 10000%n",
-                        length);
-                }
-            };
+                    "Received message was not assembled properly;" +
+                    " received length was %d, but was expecting 10000%n",
+                    length);
+            }
+        };
     }
 
     /**
@@ -145,26 +143,24 @@ public class MultipleSubscribersWithFragmentAssembly
      *
      * @param streamId to show when printing
      * @return subscription data handler function that prints the message contents
-     * @throws Exception if an error occurs
      */
-    public static FragmentHandler reassembledStringMessage2(final int streamId) throws Exception
+    public static FragmentHandler reassembledStringMessage2(final int streamId)
     {
-        return
-            (buffer, offset, length, header) ->
+        return (buffer, offset, length, header) ->
+        {
+            final byte[] data = new byte[length];
+            buffer.getBytes(offset, data);
+
+            System.out.format(
+                "message to stream %d from session %x term id %x term offset %d (%d@%d)%n",
+                streamId, header.sessionId(), header.termId(), header.termOffset(), length, offset);
+
+            if (length != 9000)
             {
-                final byte[] data = new byte[length];
-                buffer.getBytes(offset, data);
-
                 System.out.format(
-                    "message to stream %d from session %x term id %x term offset %d (%d@%d)%n",
-                    streamId, header.sessionId(), header.termId(), header.termOffset(), length, offset);
-
-                if (length != 9000)
-                {
-                    System.out.format(
-                        "Received message was not assembled properly; received length was %d, but was expecting 9000%n",
-                        length);
-                }
-            };
+                    "Received message was not assembled properly; received length was %d, but was expecting 9000%n",
+                    length);
+            }
+        };
     }
 }

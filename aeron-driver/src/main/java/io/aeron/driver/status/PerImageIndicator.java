@@ -15,13 +15,11 @@
  */
 package io.aeron.driver.status;
 
+import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.status.CountersManager;
 
-import java.nio.charset.StandardCharsets;
-
 import static io.aeron.driver.status.StreamPositionCounter.*;
-import static org.agrona.BitUtil.SIZE_OF_INT;
 
 /**
  * Allocates {@link AtomicCounter} indicating a per {@link io.aeron.driver.PublicationImage} indication.
@@ -36,41 +34,27 @@ public class PerImageIndicator
     /**
      * Allocate a per {@link io.aeron.driver.PublicationImage} indicator.
      *
+     * @param tempBuffer      to be used for labels and key.
      * @param name            of the counter for the label.
      * @param countersManager from which to allocated the underlying storage.
      * @param registrationId  to be associated with the counter.
      * @param sessionId       for the stream of messages.
      * @param streamId        for the stream of messages.
      * @param channel         for the stream of messages.
-     * @param suffix          for the label.
      * @return a new {@link AtomicCounter} for tracking the indicator.
      */
     public static AtomicCounter allocate(
+        final MutableDirectBuffer tempBuffer,
         final String name,
         final CountersManager countersManager,
         final long registrationId,
         final int sessionId,
         final int streamId,
-        final String channel,
-        final String suffix)
+        final String channel)
     {
-        final String label =
-            name + ": " + registrationId + ' ' + sessionId + ' ' + streamId + ' ' + channel + ' ' + suffix;
+        final int counterId = StreamPositionCounter.allocateCounterId(
+            tempBuffer, name, PER_IMAGE_TYPE_ID, countersManager, registrationId, sessionId, streamId, channel);
 
-        return countersManager.newCounter(
-            label,
-            PER_IMAGE_TYPE_ID,
-            (buffer) ->
-            {
-                buffer.putLong(REGISTRATION_ID_OFFSET, registrationId);
-                buffer.putInt(SESSION_ID_OFFSET, sessionId);
-                buffer.putInt(STREAM_ID_OFFSET, streamId);
-
-                final byte[] channelBytes = channel.getBytes(StandardCharsets.UTF_8);
-                final int length = Math.min(channelBytes.length, MAX_CHANNEL_LENGTH);
-
-                buffer.putInt(CHANNEL_OFFSET, length);
-                buffer.putBytes(CHANNEL_OFFSET + SIZE_OF_INT, channelBytes, 0, length);
-            });
+        return new AtomicCounter(countersManager.valuesBuffer(), counterId, countersManager);
     }
 }

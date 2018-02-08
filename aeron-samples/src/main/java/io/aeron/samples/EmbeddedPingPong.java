@@ -39,12 +39,14 @@ import org.agrona.concurrent.NoOpIdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.console.ContinueBarrier;
 
+import static org.agrona.SystemUtil.loadPropertiesFiles;
+
 public class EmbeddedPingPong
 {
     private static final int PING_STREAM_ID = SampleConfiguration.PING_STREAM_ID;
     private static final int PONG_STREAM_ID = SampleConfiguration.PONG_STREAM_ID;
-    private static final int NUMBER_OF_MESSAGES = SampleConfiguration.NUMBER_OF_MESSAGES;
-    private static final int WARMUP_NUMBER_OF_MESSAGES = SampleConfiguration.WARMUP_NUMBER_OF_MESSAGES;
+    private static final long NUMBER_OF_MESSAGES = SampleConfiguration.NUMBER_OF_MESSAGES;
+    private static final long WARMUP_NUMBER_OF_MESSAGES = SampleConfiguration.WARMUP_NUMBER_OF_MESSAGES;
     private static final int WARMUP_NUMBER_OF_ITERATIONS = SampleConfiguration.WARMUP_NUMBER_OF_ITERATIONS;
     private static final int MESSAGE_LENGTH = SampleConfiguration.MESSAGE_LENGTH;
     private static final int FRAGMENT_COUNT_LIMIT = SampleConfiguration.FRAGMENT_COUNT_LIMIT;
@@ -62,7 +64,7 @@ public class EmbeddedPingPong
 
     public static void main(final String[] args) throws Exception
     {
-        MediaDriver.loadPropertiesFiles(args);
+        loadPropertiesFiles(args);
 
         final MediaDriver.Context ctx = new MediaDriver.Context()
             .threadingMode(ThreadingMode.DEDICATED)
@@ -91,13 +93,13 @@ public class EmbeddedPingPong
 
         System.out.println("Publishing Ping at " + PING_CHANNEL + " on stream Id " + PING_STREAM_ID);
         System.out.println("Subscribing Pong at " + PONG_CHANNEL + " on stream Id " + PONG_STREAM_ID);
-        System.out.println("Message size of " + MESSAGE_LENGTH + " bytes");
+        System.out.println("Message payload length of " + MESSAGE_LENGTH + " bytes");
 
         final FragmentAssembler dataHandler = new FragmentAssembler(EmbeddedPingPong::pongHandler);
 
         try (Aeron aeron = Aeron.connect(ctx);
-             Publication pingPublication = aeron.addPublication(PING_CHANNEL, PING_STREAM_ID);
-             Subscription pongSubscription = aeron.addSubscription(PONG_CHANNEL, PONG_STREAM_ID))
+            Publication pingPublication = aeron.addPublication(PING_CHANNEL, PING_STREAM_ID);
+            Subscription pongSubscription = aeron.addSubscription(PONG_CHANNEL, PONG_STREAM_ID))
         {
             System.out.println("Waiting for new image from Pong...");
 
@@ -105,7 +107,7 @@ public class EmbeddedPingPong
 
             System.out.println(
                 "Warming up... " + WARMUP_NUMBER_OF_ITERATIONS +
-                    " iterations of " + WARMUP_NUMBER_OF_MESSAGES + " messages");
+                " iterations of " + WARMUP_NUMBER_OF_MESSAGES + " messages");
 
             for (int i = 0; i < WARMUP_NUMBER_OF_ITERATIONS; i++)
             {
@@ -131,47 +133,44 @@ public class EmbeddedPingPong
 
     private static Thread startPong(final String embeddedDirName)
     {
-        return new Thread()
+        return new Thread(() ->
         {
-            public void run()
+            System.out.println("Subscribing Ping at " + PING_CHANNEL + " on stream Id " + PING_STREAM_ID);
+            System.out.println("Publishing Pong at " + PONG_CHANNEL + " on stream Id " + PONG_STREAM_ID);
+
+            final Aeron.Context ctx = new Aeron.Context().aeronDirectoryName(embeddedDirName);
+
+            try (Aeron aeron = Aeron.connect(ctx);
+                Publication pongPublication = aeron.addPublication(PONG_CHANNEL, PONG_STREAM_ID);
+                Subscription pingSubscription = aeron.addSubscription(PING_CHANNEL, PING_STREAM_ID))
             {
-                System.out.println("Subscribing Ping at " + PING_CHANNEL + " on stream Id " + PING_STREAM_ID);
-                System.out.println("Publishing Pong at " + PONG_CHANNEL + " on stream Id " + PONG_STREAM_ID);
+                final FragmentAssembler dataHandler = new FragmentAssembler(
+                    (buffer, offset, length, header) -> pingHandler(pongPublication, buffer, offset, length));
 
-                final Aeron.Context ctx = new Aeron.Context().aeronDirectoryName(embeddedDirName);
-
-                try (Aeron aeron = Aeron.connect(ctx);
-                     Publication pongPublication = aeron.addPublication(PONG_CHANNEL, PONG_STREAM_ID);
-                     Subscription pingSubscription = aeron.addSubscription(PING_CHANNEL, PING_STREAM_ID))
+                while (RUNNING.get())
                 {
-                    final FragmentAssembler dataHandler = new FragmentAssembler(
-                        (buffer, offset, length, header) -> pingHandler(pongPublication, buffer, offset, length));
-
-                    while (RUNNING.get())
-                    {
-                        PING_HANDLER_IDLE_STRATEGY.idle(pingSubscription.poll(dataHandler, FRAME_COUNT_LIMIT));
-                    }
-
-                    System.out.println("Shutting down...");
+                    PING_HANDLER_IDLE_STRATEGY.idle(pingSubscription.poll(dataHandler, FRAME_COUNT_LIMIT));
                 }
+
+                System.out.println("Shutting down...");
             }
-        };
+        });
     }
 
     private static void roundTripMessages(
         final FragmentHandler fragmentHandler,
         final Publication pingPublication,
         final Subscription pongSubscription,
-        final int numMessages)
+        final long numMessages)
     {
-        while (pongSubscription.hasNoImages())
+        while (!pongSubscription.isConnected())
         {
             Thread.yield();
         }
 
-        final Image image = pongSubscription.getImage(0);
+        final Image image = pongSubscription.imageAtIndex(0);
 
-        for (int i = 0; i < numMessages; i++)
+        for (long i = 0; i < numMessages; i++)
         {
             long offeredPosition;
 

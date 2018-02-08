@@ -29,57 +29,72 @@ import java.util.Date;
 import static io.aeron.logbuffer.LogBufferDescriptor.*;
 import static io.aeron.protocol.DataHeaderFlyweight.HEADER_LENGTH;
 import static java.lang.Math.min;
-import static java.nio.channels.FileChannel.MapMode.READ_ONLY;
 
 /**
  * Command line utility for inspecting a log buffer to see what terms and messages it contains.
  */
 public class LogInspector
 {
+    /**
+     * Data format for fragments which can be ASCII or HEX.
+     */
+    public static final String AERON_LOG_DATA_FORMAT_PROP_NAME = "aeron.log.inspector.data.format";
+    public static final String AERON_LOG_DATA_FORMAT = System.getProperty(
+        AERON_LOG_DATA_FORMAT_PROP_NAME, "hex").toLowerCase();
+
+    /**
+     * Should the default header be skipped for output.
+     */
+    public static final String AERON_LOG_SKIP_DEFAULT_HEADER_PROP_NAME = "aeron.log.inspector.skipDefaultHeader";
+    public static final boolean AERON_LOG_SKIP_DEFAULT_HEADER = Boolean.getBoolean(
+        AERON_LOG_SKIP_DEFAULT_HEADER_PROP_NAME);
+
+    /**
+     * Should zeros be skipped in the output to reduce noise.
+     */
+    public static final String AERON_LOG_SCAN_OVER_ZEROES_PROP_NAME = "aeron.log.inspector.scanOverZeroes";
+    public static final boolean AERON_LOG_SCAN_OVER_ZEROES = Boolean.getBoolean(AERON_LOG_SCAN_OVER_ZEROES_PROP_NAME);
+
     private static final char[] HEX_ARRAY = "0123456789ABCDEF".toCharArray();
 
-    private static final String DATA_FORMAT = System.getProperty(
-        "aeron.log.inspector.data.format", "hex").toLowerCase();
-    private static final boolean SKIP_DEFAULT_HEADER = Boolean.getBoolean("aeron.log.inspector.skipDefaultHeader");
-    private static final boolean SCAN_OVER_ZEROES = Boolean.getBoolean("aeron.log.inspector.scanOverZeroes");
-
-    public static void main(final String[] args) throws Exception
+    public static void main(final String[] args)
     {
         final PrintStream out = System.out;
         if (args.length < 1)
         {
-            out.println("Usage: LogInspector <logFileName> [message dump limit]");
+            out.println("Usage: LogInspector <logFileName> [dump limit in bytes per message]");
             return;
         }
 
         final String logFileName = args[0];
         final int messageDumpLimit = args.length >= 2 ? Integer.parseInt(args[1]) : Integer.MAX_VALUE;
 
-        try (LogBuffers logBuffers = new LogBuffers(logFileName, READ_ONLY))
+        try (LogBuffers logBuffers = new LogBuffers(logFileName))
         {
             out.println("======================================================================");
             out.format("%s Inspection dump for %s%n", new Date(), logFileName);
             out.println("======================================================================");
 
             final DataHeaderFlyweight dataHeaderFlyweight = new DataHeaderFlyweight();
-            final UnsafeBuffer[] termBuffers = logBuffers.termBuffers();
+            final UnsafeBuffer[] termBuffers = logBuffers.duplicateTermBuffers();
             final int termLength = logBuffers.termLength();
             final UnsafeBuffer metaDataBuffer = logBuffers.metaDataBuffer();
             final int initialTermId = initialTermId(metaDataBuffer);
 
-            out.format("Time of last SM: %s%n", new Date(timeOfLastStatusMessage(metaDataBuffer)));
+            out.format("   Is Connected: %s%n", isConnected(metaDataBuffer));
             out.format("Initial term id: %d%n", initialTermId);
-            out.format("   Active index: %d%n", activePartitionIndex(metaDataBuffer));
+            out.format("     Term Count: %d%n", activeTermCount(metaDataBuffer));
+            out.format("   Active index: %d%n", indexByTermCount(activeTermCount(metaDataBuffer)));
             out.format("    Term length: %d%n", termLength);
             out.format("     MTU length: %d%n", mtuLength(metaDataBuffer));
+            out.format("      Page Size: %d%n", pageSize(metaDataBuffer));
             out.format("   EOS Position: %d%n%n", endOfStreamPosition(metaDataBuffer));
 
-            if (!SKIP_DEFAULT_HEADER)
+            if (!AERON_LOG_SKIP_DEFAULT_HEADER)
             {
                 dataHeaderFlyweight.wrap(defaultFrameHeader(metaDataBuffer));
                 out.format("default %s%n", dataHeaderFlyweight);
             }
-
             out.println();
 
             for (int i = 0; i < PARTITION_COUNT; i++)
@@ -88,15 +103,14 @@ public class LogInspector
                 final long termOffset = rawTail & 0xFFFF_FFFFL;
                 final int termId = termId(rawTail);
                 final int offset = (int)Math.min(termOffset, termLength);
-                final int bitsToShift = Integer.numberOfTrailingZeros(termLength);
+                final int positionBitsToShift = LogBufferDescriptor.positionBitsToShift(termLength);
                 out.format(
                     "Index %d Term Meta Data termOffset=%d termId=%d rawTail=%d position=%d%n",
                     i,
                     termOffset,
                     termId,
                     rawTail,
-                    LogBufferDescriptor.computePosition(termId, offset, bitsToShift, initialTermId)
-                );
+                    LogBufferDescriptor.computePosition(termId, offset, positionBitsToShift, initialTermId));
             }
 
             for (int i = 0; i < PARTITION_COUNT; i++)
@@ -115,7 +129,7 @@ public class LogInspector
                     final int frameLength = dataHeaderFlyweight.frameLength();
                     if (frameLength < DataHeaderFlyweight.HEADER_LENGTH)
                     {
-                        if (0 == frameLength && SCAN_OVER_ZEROES)
+                        if (0 == frameLength && AERON_LOG_SCAN_OVER_ZEROES)
                         {
                             offset += FrameDescriptor.FRAME_ALIGNMENT;
                             continue;
@@ -147,8 +161,10 @@ public class LogInspector
 
     public static char[] formatBytes(final DirectBuffer buffer, final int offset, final int length)
     {
-        switch (DATA_FORMAT)
+        switch (AERON_LOG_DATA_FORMAT)
         {
+            case "us-ascii":
+            case "us_ascii":
             case "ascii":
                 return bytesToAscii(buffer, offset, length);
 

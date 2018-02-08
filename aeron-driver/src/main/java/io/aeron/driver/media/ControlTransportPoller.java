@@ -49,7 +49,8 @@ public class ControlTransportPoller extends UdpTransportPoller
 
     public ControlTransportPoller()
     {
-        byteBuffer = NetworkUtil.allocateDirectAlignedAndPadded(Configuration.MTU_LENGTH, CACHE_LINE_LENGTH * 2);
+        byteBuffer = NetworkUtil.allocateDirectAlignedAndPadded(
+            Configuration.MAX_UDP_PAYLOAD_LENGTH, CACHE_LINE_LENGTH * 2);
         unsafeBuffer = new UnsafeBuffer(byteBuffer);
         nakMessage = new NakFlyweight(unsafeBuffer);
         statusMessage = new StatusMessageFlyweight(unsafeBuffer);
@@ -109,8 +110,8 @@ public class ControlTransportPoller extends UdpTransportPoller
         SelectionKey key = null;
         try
         {
-            transports = ArrayUtil.add(transports, transport);
             key = transport.receiveDatagramChannel().register(selector, SelectionKey.OP_READ, transport);
+            transports = ArrayUtil.add(transports, transport);
         }
         catch (final ClosedChannelException ex)
         {

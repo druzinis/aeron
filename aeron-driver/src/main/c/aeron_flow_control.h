@@ -22,10 +22,14 @@
 
 typedef struct aeron_flow_control_strategy_stct aeron_flow_control_strategy_t;
 
+#define AERON_MAX_FLOW_CONTROL_STRATEGY_RECEIVER_TIMEOUT_NS (2 * 1000 * 1000 * 1000L)
+
 typedef int64_t (*aeron_flow_control_strategy_on_idle_func_t)(
     void *state,
     int64_t now_ns,
-    int64_t snd_lmt);
+    int64_t snd_lmt,
+    int64_t snd_pos,
+    bool is_end_of_stream);
 
 typedef int64_t (*aeron_flow_control_strategy_on_sm_func_t)(
     void *state,
@@ -37,6 +41,10 @@ typedef int64_t (*aeron_flow_control_strategy_on_sm_func_t)(
     size_t position_bits_to_shift,
     int64_t now_ns);
 
+typedef bool (*aeron_flow_control_strategy_should_linger_func_t)(
+    void *state,
+    int64_t now_ns);
+
 typedef int (*aeron_flow_control_strategy_fini_func_t)(
     aeron_flow_control_strategy_t *strategy);
 
@@ -44,6 +52,7 @@ typedef struct aeron_flow_control_strategy_stct
 {
     aeron_flow_control_strategy_on_sm_func_t on_status_message;
     aeron_flow_control_strategy_on_idle_func_t on_idle;
+    aeron_flow_control_strategy_should_linger_func_t should_linger;
     aeron_flow_control_strategy_fini_func_t fini;
     void *state;
 }

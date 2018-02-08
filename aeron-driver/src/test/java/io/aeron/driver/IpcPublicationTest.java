@@ -41,6 +41,7 @@ import static org.mockito.Mockito.when;
 
 public class IpcPublicationTest
 {
+    private static final long CLIENT_ID = 7L;
     private static final int STREAM_ID = 10;
     private static final int TERM_BUFFER_LENGTH = Configuration.TERM_BUFFER_LENGTH_DEFAULT;
     private static final int BUFFER_LENGTH = 16 * 1024;
@@ -56,11 +57,10 @@ public class IpcPublicationTest
 
     @SuppressWarnings("unchecked")
     @Before
-    public void setUp() throws Exception
+    public void setUp()
     {
-        final RingBuffer fromClientCommands =
-            new ManyToOneRingBuffer(new UnsafeBuffer(
-                ByteBuffer.allocateDirect(Configuration.CONDUCTOR_BUFFER_LENGTH)));
+        final RingBuffer fromClientCommands = new ManyToOneRingBuffer(new UnsafeBuffer(
+            ByteBuffer.allocateDirect(Configuration.CONDUCTOR_BUFFER_LENGTH)));
 
         final RawLogFactory mockRawLogFactory = mock(RawLogFactory.class);
         final UnsafeBuffer counterBuffer = new UnsafeBuffer(ByteBuffer.allocateDirect(BUFFER_LENGTH));
@@ -77,13 +77,15 @@ public class IpcPublicationTest
             .clientProxy(mock(ClientProxy.class))
             .driverCommandQueue(mock(ManyToOneConcurrentArrayQueue.class))
             .epochClock(new SystemEpochClock())
+            .cachedEpochClock(new CachedEpochClock())
+            .cachedNanoClock(new CachedNanoClock())
             .countersManager(countersManager)
             .systemCounters(mock(SystemCounters.class))
             .nanoClock(nanoClock);
 
         ctx.countersValuesBuffer(counterBuffer);
 
-        driverProxy = new DriverProxy(fromClientCommands);
+        driverProxy = new DriverProxy(fromClientCommands, CLIENT_ID);
         driverConductor = new DriverConductor(ctx);
 
         driverProxy.addPublication(CommonContext.IPC_CHANNEL, STREAM_ID);
@@ -114,7 +116,7 @@ public class IpcPublicationTest
     }
 
     @Test
-    public void shouldIncrementPublisherLimitOnSubscription() throws Exception
+    public void shouldIncrementPublisherLimitOnSubscription()
     {
         driverProxy.addSubscription(CommonContext.IPC_CHANNEL, STREAM_ID);
         driverConductor.doWork();

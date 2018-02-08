@@ -72,7 +72,7 @@ namespace CncFileDescriptor {
 
 static const std::string CNC_FILE = "cnc.dat";
 
-static const std::int32_t CNC_VERSION = 7;
+static const std::int32_t CNC_VERSION = 12;
 
 #pragma pack(push)
 #pragma pack(4)
@@ -90,13 +90,11 @@ struct MetaDataDefn
 
 static const size_t META_DATA_LENGTH = BitUtil::align(sizeof(MetaDataDefn), BitUtil::CACHE_LINE_LENGTH * 2);
 
-inline static std::int32_t cncVersion(MemoryMappedFile::ptr_t cncFile)
+inline static std::int32_t cncVersionVolatile(MemoryMappedFile::ptr_t cncFile)
 {
     AtomicBuffer metaDataBuffer(cncFile->getMemoryPtr(), convertSizeToIndex(cncFile->getMemorySize()));
 
-    const MetaDataDefn& metaData = metaDataBuffer.overlayStruct<MetaDataDefn>(0);
-
-    return metaData.cncVersion;
+    return metaDataBuffer.getInt32Volatile(offsetof(MetaDataDefn, cncVersion));
 }
 
 inline static AtomicBuffer createToDriverBuffer(MemoryMappedFile::ptr_t cncFile)

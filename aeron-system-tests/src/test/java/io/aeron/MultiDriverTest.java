@@ -17,6 +17,7 @@ package io.aeron;
 
 import io.aeron.driver.MediaDriver;
 import org.agrona.DirectBuffer;
+import org.agrona.collections.MutableInteger;
 import org.junit.After;
 import org.junit.Test;
 import io.aeron.driver.ThreadingMode;
@@ -30,7 +31,7 @@ import java.io.File;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+
 
 import static org.mockito.Mockito.*;
 
@@ -51,11 +52,6 @@ public class MultiDriverTest
     private static final String ROOT_DIR =
         IoUtil.tmpDirName() + "aeron-system-tests-" + UUID.randomUUID().toString() + File.separator;
 
-    private final MediaDriver.Context driverAContext = new MediaDriver.Context();
-    private final MediaDriver.Context driverBContext = new MediaDriver.Context();
-    private final Aeron.Context aeronAContext = new Aeron.Context();
-    private final Aeron.Context aeronBContext = new Aeron.Context();
-
     private Aeron clientA;
     private Aeron clientB;
     private MediaDriver driverA;
@@ -75,22 +71,22 @@ public class MultiDriverTest
 
         buffer.putInt(0, 1);
 
-        driverAContext.publicationTermBufferLength(TERM_BUFFER_LENGTH)
+        final MediaDriver.Context driverAContext = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
+            .publicationTermBufferLength(TERM_BUFFER_LENGTH)
             .aeronDirectoryName(baseDirA)
             .threadingMode(THREADING_MODE);
 
-        aeronAContext.aeronDirectoryName(driverAContext.aeronDirectoryName());
-
-        driverBContext.publicationTermBufferLength(TERM_BUFFER_LENGTH)
+        final MediaDriver.Context driverBContext = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
+            .publicationTermBufferLength(TERM_BUFFER_LENGTH)
             .aeronDirectoryName(baseDirB)
             .threadingMode(THREADING_MODE);
 
-        aeronBContext.aeronDirectoryName(driverBContext.aeronDirectoryName());
-
         driverA = MediaDriver.launch(driverAContext);
         driverB = MediaDriver.launch(driverBContext);
-        clientA = Aeron.connect(aeronAContext);
-        clientB = Aeron.connect(aeronBContext);
+        clientA = Aeron.connect(new Aeron.Context().aeronDirectoryName(driverAContext.aeronDirectoryName()));
+        clientB = Aeron.connect(new Aeron.Context().aeronDirectoryName(driverBContext.aeronDirectoryName()));
     }
 
     @After
@@ -117,7 +113,7 @@ public class MultiDriverTest
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
         subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (subscriptionA.hasNoImages() && subscriptionB.hasNoImages())
+        while (!subscriptionA.isConnected() && !subscriptionB.isConnected())
         {
             Thread.sleep(1);
         }
@@ -128,9 +124,6 @@ public class MultiDriverTest
     {
         final int numMessagesToSendPreJoin = NUM_MESSAGES_PER_TERM / 2;
         final int numMessagesToSendPostJoin = NUM_MESSAGES_PER_TERM;
-        final CountDownLatch newImageLatch = new CountDownLatch(1);
-
-        aeronBContext.availableImageHandler((image) -> newImageLatch.countDown());
 
         launch();
 
@@ -144,21 +137,21 @@ public class MultiDriverTest
                 Thread.yield();
             }
 
-            final AtomicInteger fragmentsRead = new AtomicInteger();
+            final MutableInteger fragmentsRead = new MutableInteger();
             SystemTestHelper.executeUntil(
                 () -> fragmentsRead.get() > 0,
                 (j) ->
                 {
-                    fragmentsRead.getAndAdd(subscriptionA.poll(fragmentHandlerA, 10));
+                    fragmentsRead.value += subscriptionA.poll(fragmentHandlerA, 10);
                     Thread.yield();
                 },
                 Integer.MAX_VALUE,
                 TimeUnit.MILLISECONDS.toNanos(500));
         }
 
-        subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
+        final CountDownLatch newImageLatch = new CountDownLatch(1);
+        subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID, (image) -> newImageLatch.countDown(), null);
 
-        // wait until new subscriber gets new image indication
         newImageLatch.await();
 
         for (int i = 0; i < numMessagesToSendPostJoin; i++)
@@ -168,12 +161,12 @@ public class MultiDriverTest
                 Thread.yield();
             }
 
-            final AtomicInteger fragmentsRead = new AtomicInteger();
+            final MutableInteger fragmentsRead = new MutableInteger();
             SystemTestHelper.executeUntil(
                 () -> fragmentsRead.get() > 0,
                 (j) ->
                 {
-                    fragmentsRead.addAndGet(subscriptionA.poll(fragmentHandlerA, 10));
+                    fragmentsRead.value += subscriptionA.poll(fragmentHandlerA, 10);
                     Thread.yield();
                 },
                 Integer.MAX_VALUE,
@@ -184,7 +177,7 @@ public class MultiDriverTest
                 () -> fragmentsRead.get() > 0,
                 (j) ->
                 {
-                    fragmentsRead.addAndGet(subscriptionB.poll(fragmentHandlerB, 10));
+                    fragmentsRead.value += subscriptionB.poll(fragmentHandlerB, 10);
                     Thread.yield();
                 },
                 Integer.MAX_VALUE,
@@ -209,23 +202,20 @@ public class MultiDriverTest
     {
         final int numMessagesToSendPreJoin = 0;
         final int numMessagesToSendPostJoin = NUM_MESSAGES_PER_TERM;
-        final CountDownLatch newImageLatch = new CountDownLatch(1);
-
-        aeronBContext.availableImageHandler((image) -> newImageLatch.countDown());
 
         launch();
 
         publication = clientA.addPublication(MULTICAST_URI, STREAM_ID);
         subscriptionA = clientA.addSubscription(MULTICAST_URI, STREAM_ID);
 
-        while (!publication.isConnected() && subscriptionA.hasNoImages())
+        while (!publication.isConnected() && !subscriptionA.isConnected())
         {
             Thread.yield();
         }
 
-        subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID);
+        final CountDownLatch newImageLatch = new CountDownLatch(1);
+        subscriptionB = clientB.addSubscription(MULTICAST_URI, STREAM_ID, (image) -> newImageLatch.countDown(), null);
 
-        // wait until new subscriber gets new image indication
         newImageLatch.await();
 
         for (int i = 0; i < numMessagesToSendPostJoin; i++)
@@ -235,12 +225,12 @@ public class MultiDriverTest
                 Thread.yield();
             }
 
-            final AtomicInteger fragmentsRead = new AtomicInteger();
+            final MutableInteger fragmentsRead = new MutableInteger();
             SystemTestHelper.executeUntil(
                 () -> fragmentsRead.get() > 0,
                 (j) ->
                 {
-                    fragmentsRead.addAndGet(subscriptionA.poll(fragmentHandlerA, 10));
+                    fragmentsRead.value += subscriptionA.poll(fragmentHandlerA, 10);
                     Thread.yield();
                 },
                 Integer.MAX_VALUE,
@@ -251,7 +241,7 @@ public class MultiDriverTest
                 () -> fragmentsRead.get() > 0,
                 (j) ->
                 {
-                    fragmentsRead.addAndGet(subscriptionB.poll(fragmentHandlerB, 10));
+                    fragmentsRead.value += subscriptionB.poll(fragmentHandlerB, 10);
                     Thread.yield();
                 },
                 Integer.MAX_VALUE,

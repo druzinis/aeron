@@ -68,7 +68,7 @@ public class CncFileDescriptor
 {
     public static final String CNC_FILE = "cnc.dat";
 
-    public static final int CNC_VERSION = 7;
+    public static final int CNC_VERSION = 12;
 
     public static final int CNC_VERSION_FIELD_OFFSET;
     public static final int TO_DRIVER_BUFFER_LENGTH_FIELD_OFFSET;
@@ -96,11 +96,12 @@ public class CncFileDescriptor
      * Compute the length of the cnc file and return it.
      *
      * @param totalLengthOfBuffers in bytes
+     * @param alignment for file length to adhere to
      * @return cnc file length in bytes
      */
-    public static int computeCncFileLength(final int totalLengthOfBuffers)
+    public static int computeCncFileLength(final int totalLengthOfBuffers, final int alignment)
     {
-        return END_OF_METADATA_OFFSET + totalLengthOfBuffers;
+        return align(END_OF_METADATA_OFFSET + totalLengthOfBuffers, alignment);
     }
 
     public static int cncVersionOffset(final int baseOffset)
@@ -153,6 +154,10 @@ public class CncFileDescriptor
         cncMetaDataBuffer.putInt(countersValuesBufferLengthOffset(0), counterValuesBufferLength);
         cncMetaDataBuffer.putInt(errorLogBufferLengthOffset(0), errorLogBufferLength);
         cncMetaDataBuffer.putLong(clientLivenessTimeoutOffset(0), clientLivenessTimeout);
+    }
+
+    public static void signalCncReady(final UnsafeBuffer cncMetaDataBuffer)
+    {
         cncMetaDataBuffer.putIntVolatile(cncVersionOffset(0), CNC_VERSION);
     }
 

@@ -26,6 +26,11 @@ endif()
 
 option(BUILD_AERON_DRIVER "Build Aeron driver" OFF)
 
+option(C_WARNINGS_AS_ERRORS "Enable warnings as errors for C" OFF)
+option(CXX_WARNINGS_AS_ERRORS "Enable warnings as errors for C++" OFF)
+option(SANITISE_BUILD "Enable sanitise options" OFF)
+option(COVERAGE_BUILD "Enable code coverage" OFF)
+
 include(ExternalProject)
 
 project("aeron" VERSION "${VERSION_FROM_FILE}")
@@ -63,8 +68,8 @@ set(GMOCK_LIBS
 
 ExternalProject_Add(
     hdr_histogram
-    URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/HdrHistogram_c-HdrHistogram_c-0.9.1.zip
-    URL_MD5 4d2b56927056ce4c9eec4cfe3f61c6f7
+    URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/HdrHistogram_c.zip
+    URL_MD5 8d1d6c6df1ee8342c180529a89568081
     INSTALL_COMMAND ""
 )
 
@@ -118,6 +123,26 @@ if(UNIX)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wpedantic -Wextra -Wno-unused-parameter -std=c++11 -fexceptions -g")
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wpedantic -Wextra -Wno-unused-parameter -std=c11 -g")
     endif()
+
+    if(C_WARNINGS_AS_ERRORS)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror")
+    endif(C_WARNINGS_AS_ERRORS)
+
+    if(CXX_WARNINGS_AS_ERRORS)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+    endif(CXX_WARNINGS_AS_ERRORS)
+
+    if(SANITISE_BUILD)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fsanitize=leak -fsanitize=undefined")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fsanitize=leak -fsanitize=undefined")
+    endif(SANITISE_BUILD)
+
+    if (COVERAGE_BUILD)
+        SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -fno-inline --coverage -g")
+        SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -fno-inline --coverage -g")
+        SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
+    endif(COVERAGE_BUILD)
+
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0")
     set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Ofast")
@@ -139,9 +164,18 @@ elseif(MSVC)
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
     add_definitions(-DNOMINMAX)
 
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd /Od /Zi")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd /Od /Zi /MP")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT /MP")
+
+    if(C_WARNINGS_AS_ERRORS)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /WX")
+    endif(C_WARNINGS_AS_ERRORS)
+
+    if(CXX_WARNINGS_AS_ERRORS)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /WX")
+    endif(CXX_WARNINGS_AS_ERRORS)
 endif()
+
 
 ##########################################################
 # Project variables, etc.

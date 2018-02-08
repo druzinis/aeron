@@ -16,9 +16,6 @@
 package io.aeron;
 
 import org.junit.Test;
-import org.junit.experimental.theories.Theories;
-import org.junit.experimental.theories.Theory;
-import org.junit.runner.RunWith;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.ControlledFragmentHandler;
@@ -29,7 +26,6 @@ import org.agrona.concurrent.UnsafeBuffer;
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertThat;
 
-@RunWith(Theories.class)
 public class ControlledMessageTest
 {
     public static final String CHANNEL = CommonContext.IPC_CHANNEL;
@@ -37,17 +33,17 @@ public class ControlledMessageTest
     public static final int FRAGMENT_COUNT_LIMIT = 10;
     public static final int PAYLOAD_LENGTH = 10;
 
-    @Theory
     @Test(timeout = 10000)
-    public void shouldReceivePublishedMessage() throws Exception
+    public void shouldReceivePublishedMessage()
     {
-        final MediaDriver.Context ctx = new MediaDriver.Context();
-        ctx.threadingMode(ThreadingMode.SHARED);
+        final MediaDriver.Context ctx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
+            .threadingMode(ThreadingMode.SHARED);
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
         {
             final UnsafeBuffer srcBuffer = new UnsafeBuffer(new byte[PAYLOAD_LENGTH * 4]);
 

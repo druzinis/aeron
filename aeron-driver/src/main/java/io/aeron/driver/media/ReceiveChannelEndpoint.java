@@ -16,20 +16,20 @@
 package io.aeron.driver.media;
 
 import io.aeron.driver.*;
-import io.aeron.driver.exceptions.ConfigurationException;
-import io.aeron.driver.status.ChannelEndpointStatus;
+import io.aeron.status.ChannelEndpointStatus;
 import io.aeron.protocol.*;
 import org.agrona.LangUtil;
+import org.agrona.collections.Hashing;
 import org.agrona.collections.Int2IntCounterMap;
+import org.agrona.collections.Long2LongCounterMap;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.UnsafeBuffer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 
-import static io.aeron.driver.status.ChannelEndpointStatus.status;
+import static io.aeron.status.ChannelEndpointStatus.status;
 import static io.aeron.driver.status.SystemCounterDescriptor.*;
 import static io.aeron.protocol.StatusMessageFlyweight.SEND_SETUP_FLAG;
 
@@ -51,9 +51,9 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
     private final AtomicCounter possibleTtlAsymmetry;
     private final AtomicCounter statusIndicator;
     private final Int2IntCounterMap refCountByStreamIdMap = new Int2IntCounterMap(0);
+    private final Long2LongCounterMap refCountByStreamIdAndSessionIdMap = new Long2LongCounterMap(0);
 
     private final long receiverId;
-    private int soRcvBufLength;
     private boolean isClosed = false;
 
     public ReceiveChannelEndpoint(
@@ -98,7 +98,10 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
         int bytesSent = 0;
         try
         {
-            bytesSent = sendDatagramChannel.send(buffer, remoteAddress);
+            if (null != sendDatagramChannel)
+            {
+                bytesSent = sendDatagramChannel.send(buffer, remoteAddress);
+            }
         }
         catch (final IOException ex)
         {
@@ -111,6 +114,11 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
     public String originalUriString()
     {
         return udpChannel().originalUriString();
+    }
+
+    public int statusIndicatorCounterId()
+    {
+        return statusIndicator.id();
     }
 
     public void indicateActive()
@@ -140,16 +148,29 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
         isClosed = true;
     }
 
-    public void openChannel()
+    public void openChannel(final DriverConductorProxy conductorProxy)
     {
-        openDatagramChannel(statusIndicator);
-
-        soRcvBufLength = getOption(StandardSocketOptions.SO_RCVBUF);
+        if (conductorProxy.notConcurrent())
+        {
+            openDatagramChannel(statusIndicator);
+        }
+        else
+        {
+            try
+            {
+                openDatagramChannel(statusIndicator);
+            }
+            catch (final Exception ex)
+            {
+                conductorProxy.channelEndpointError(statusIndicator.id(), ex);
+                throw ex;
+            }
+        }
     }
 
     public void possibleTtlAsymmetryEncountered()
     {
-        possibleTtlAsymmetry.orderedIncrement();
+        possibleTtlAsymmetry.incrementOrdered();
     }
 
     public int incRefToStream(final int streamId)
@@ -170,14 +191,37 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
         return count;
     }
 
+    public long incRefToStreamAndSession(final int streamId, final int sessionId)
+    {
+        return refCountByStreamIdAndSessionIdMap.incrementAndGet(Hashing.compoundKey(streamId, sessionId));
+    }
+
+    public long decRefToStreamAndSession(final int streamId, final int sessionId)
+    {
+        final long key = Hashing.compoundKey(streamId, sessionId);
+
+        final long count = refCountByStreamIdAndSessionIdMap.decrementAndGet(key);
+
+        if (-1 == count)
+        {
+            refCountByStreamIdAndSessionIdMap.remove(key);
+            throw new IllegalStateException(
+                "Could not find stream Id + session Id to decrement: " + streamId + " " + sessionId);
+        }
+
+        return count;
+    }
+
     public int streamCount()
     {
-        return refCountByStreamIdMap.size();
+        return refCountByStreamIdMap.size() + refCountByStreamIdAndSessionIdMap.size();
     }
 
     public boolean shouldBeClosed()
     {
-        return refCountByStreamIdMap.isEmpty() && !statusIndicator.isClosed();
+        return refCountByStreamIdMap.isEmpty() &&
+            refCountByStreamIdAndSessionIdMap.isEmpty() &&
+            !statusIndicator.isClosed();
     }
 
     public boolean hasExplicitControl()
@@ -224,28 +268,6 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
         final InetSocketAddress controlAddress, final int sessionId, final int streamId)
     {
         sendStatusMessage(controlAddress, sessionId, streamId, 0, 0, 0, SEND_SETUP_FLAG);
-    }
-
-    public void validateSenderMtuLength(final int senderMtuLength, final int windowMaxLength)
-    {
-        Configuration.validateMtuLength(senderMtuLength);
-        Configuration.validateInitialWindowLength(windowMaxLength, senderMtuLength);
-
-        if (windowMaxLength > soRcvBufLength)
-        {
-            throw new ConfigurationException("Max Window length greater than socket SO_RCVBUF, increase '" +
-                Configuration.INITIAL_WINDOW_LENGTH_PROP_NAME +
-                "' to match window: windowMaxLength=" + windowMaxLength +
-                ", SO_RCVBUF=" + soRcvBufLength);
-        }
-
-        if (senderMtuLength > soRcvBufLength)
-        {
-            throw new ConfigurationException("Sender MTU greater than socket SO_RCVBUF, increase '" +
-                Configuration.SOCKET_RCVBUF_LENGTH_PROP_NAME +
-                "' to match MTU: senderMtuLength=" + senderMtuLength +
-                ", SO_RCVBUF=" + soRcvBufLength);
-        }
     }
 
     public void sendStatusMessage(
@@ -343,9 +365,19 @@ public class ReceiveChannelEndpoint extends UdpChannelTransport
         dispatcher.addSubscription(streamId);
     }
 
+    public void addSubscription(final int streamId, final int sessionId)
+    {
+        dispatcher.addSubscription(streamId, sessionId);
+    }
+
     public void removeSubscription(final int streamId)
     {
         dispatcher.removeSubscription(streamId);
+    }
+
+    public void removeSubscription(final int streamId, final int sessionId)
+    {
+        dispatcher.removeSubscription(streamId, sessionId);
     }
 
     public void addPublicationImage(final PublicationImage image)

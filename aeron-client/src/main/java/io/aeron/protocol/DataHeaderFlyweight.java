@@ -15,6 +15,8 @@
  */
 package io.aeron.protocol;
 
+import io.aeron.logbuffer.FrameDescriptor;
+import org.agrona.BufferUtil;
 import org.agrona.concurrent.UnsafeBuffer;
 
 import java.nio.ByteBuffer;
@@ -82,6 +84,29 @@ public class DataHeaderFlyweight extends HeaderFlyweight
     }
 
     /**
+     * Is the frame at data frame at the beginning of packet a heartbeat message?
+     *
+     * @param packet containing the data frame.
+     * @param length of the data frame.
+     * @return true if a heartbeat otherwise false.
+     */
+    public static boolean isHeartbeat(final UnsafeBuffer packet, final int length)
+    {
+        return length == HEADER_LENGTH && packet.getInt(0) == 0;
+    }
+
+    /**
+     * Does the data frame in the packet have the EOS flag set?
+     *
+     * @param packet containing the data frame.
+     * @return true if the EOS flag is set otherwise false.
+     */
+    public static boolean isEndOfStream(final UnsafeBuffer packet)
+    {
+        return BEGIN_END_AND_EOS_FLAGS == (packet.getByte(FLAGS_FIELD_OFFSET) & 0xFF);
+    }
+
+    /**
      * return session id field
      *
      * @return session id field
@@ -89,6 +114,11 @@ public class DataHeaderFlyweight extends HeaderFlyweight
     public int sessionId()
     {
         return getInt(SESSION_ID_FIELD_OFFSET, LITTLE_ENDIAN);
+    }
+
+    public static int sessionId(final UnsafeBuffer termBuffer, final int frameOffset)
+    {
+        return termBuffer.getInt(frameOffset + SESSION_ID_FIELD_OFFSET, LITTLE_ENDIAN);
     }
 
     /**
@@ -114,6 +144,11 @@ public class DataHeaderFlyweight extends HeaderFlyweight
         return getInt(STREAM_ID_FIELD_OFFSET, LITTLE_ENDIAN);
     }
 
+    public static int streamId(final UnsafeBuffer termBuffer, final int frameOffset)
+    {
+        return termBuffer.getInt(frameOffset + STREAM_ID_FIELD_OFFSET, LITTLE_ENDIAN);
+    }
+
     /**
      * set stream id field
      *
@@ -137,6 +172,11 @@ public class DataHeaderFlyweight extends HeaderFlyweight
         return getInt(TERM_ID_FIELD_OFFSET, LITTLE_ENDIAN);
     }
 
+    public static int termId(final UnsafeBuffer termBuffer, final int frameOffset)
+    {
+        return termBuffer.getInt(frameOffset + TERM_ID_FIELD_OFFSET, LITTLE_ENDIAN);
+    }
+
     /**
      * set term id field
      *
@@ -158,6 +198,11 @@ public class DataHeaderFlyweight extends HeaderFlyweight
     public int termOffset()
     {
         return getInt(TERM_OFFSET_FIELD_OFFSET, LITTLE_ENDIAN);
+    }
+
+    public static int termOffset(final UnsafeBuffer termBuffer, final int frameOffset)
+    {
+        return termBuffer.getInt(frameOffset + TERM_OFFSET_FIELD_OFFSET, LITTLE_ENDIAN);
     }
 
     /**
@@ -216,7 +261,8 @@ public class DataHeaderFlyweight extends HeaderFlyweight
      */
     public static UnsafeBuffer createDefaultHeader(final int sessionId, final int streamId, final int termId)
     {
-        final UnsafeBuffer buffer = new UnsafeBuffer(new byte[HEADER_LENGTH]);
+        final UnsafeBuffer buffer =
+            new UnsafeBuffer(BufferUtil.allocateDirectAligned(HEADER_LENGTH, FrameDescriptor.FRAME_ALIGNMENT));
 
         buffer.putByte(VERSION_FIELD_OFFSET, CURRENT_VERSION);
         buffer.putByte(FLAGS_FIELD_OFFSET, (byte)BEGIN_AND_END_FLAGS);

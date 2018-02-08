@@ -45,12 +45,13 @@ public class MemoryOrderingTest
         final UnsafeBuffer srcBuffer = new UnsafeBuffer(ByteBuffer.allocateDirect(MESSAGE_LENGTH));
         srcBuffer.setMemory(0, MESSAGE_LENGTH, (byte)7);
         final MediaDriver.Context ctx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
             .publicationTermBufferLength(TERM_BUFFER_LENGTH);
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
         {
             final BusySpinIdleStrategy idleStrategy = new BusySpinIdleStrategy();
 
@@ -101,13 +102,14 @@ public class MemoryOrderingTest
     {
         final UnsafeBuffer srcBuffer = new UnsafeBuffer(ByteBuffer.allocateDirect(MESSAGE_LENGTH));
         srcBuffer.setMemory(0, MESSAGE_LENGTH, (byte)7);
+
         final MediaDriver.Context ctx = new MediaDriver.Context()
             .publicationTermBufferLength(TERM_BUFFER_LENGTH);
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             ExclusivePublication publication = aeron.addExclusivePublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            ExclusivePublication publication = aeron.addExclusivePublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
         {
             final BusySpinIdleStrategy idleStrategy = new BusySpinIdleStrategy();
 
@@ -155,6 +157,7 @@ public class MemoryOrderingTest
 
     static class Subscriber implements Runnable, FragmentHandler
     {
+        private final FragmentAssembler fragmentAssembler = new FragmentAssembler(this);
         private final Subscription subscription;
 
         long previousValue = -1;
@@ -171,7 +174,7 @@ public class MemoryOrderingTest
 
             while (messageNum < NUM_MESSAGES && null == failedMessage)
             {
-                idleStrategy.idle(subscription.poll(this, FRAGMENT_COUNT_LIMIT));
+                idleStrategy.idle(subscription.poll(fragmentAssembler, FRAGMENT_COUNT_LIMIT));
             }
         }
 
@@ -187,8 +190,8 @@ public class MemoryOrderingTest
                 final String msg = "Issue at message number transition: " + previousValue + " -> " + messageValue;
 
                 System.out.println(msg + "\n" +
-                    "offset: "  + offset + "\n" +
-                    "length: "  + length + "\n" +
+                    "offset: " + offset + "\n" +
+                    "length: " + length + "\n" +
                     "expected bytes: " + byteString(expectedValue) + "\n" +
                     "received bytes: " + byteString(messageValue) + "\n" +
                     "expected bits: " + Long.toBinaryString(expectedValue) + "\n" +

@@ -17,9 +17,10 @@ package io.aeron.samples;
 
 import io.aeron.CncFileDescriptor;
 import io.aeron.CommonContext;
-import io.aeron.driver.status.ChannelEndpointStatus;
+import io.aeron.status.ChannelEndpointStatus;
 import org.agrona.DirectBuffer;
 import org.agrona.IoUtil;
+import org.agrona.SystemUtil;
 import org.agrona.concurrent.SigInt;
 import org.agrona.concurrent.status.CountersReader;
 
@@ -38,6 +39,7 @@ import static io.aeron.driver.status.PublisherLimit.PUBLISHER_LIMIT_TYPE_ID;
 import static io.aeron.driver.status.ReceiveChannelStatus.RECEIVE_CHANNEL_STATUS_TYPE_ID;
 import static io.aeron.driver.status.ReceiverPos.RECEIVER_POS_TYPE_ID;
 import static io.aeron.driver.status.SendChannelStatus.SEND_CHANNEL_STATUS_TYPE_ID;
+import static io.aeron.driver.status.SenderLimit.SENDER_LIMIT_TYPE_ID;
 import static io.aeron.driver.status.StreamPositionCounter.*;
 import static io.aeron.driver.status.SystemCounterDescriptor.SYSTEM_COUNTER_TYPE_ID;
 
@@ -54,11 +56,19 @@ import static io.aeron.driver.status.SystemCounterDescriptor.SYSTEM_COUNTER_TYPE
  */
 public class AeronStat
 {
+    private static final String ANSI_CLS = "\u001b[2J";
+    private static final String ANSI_HOME = "\u001b[H";
+
+    /**
+     * The delay in second between each update.
+     */
+    private static final String DELAY = "delay";
+
     /**
      * Types of the counters.
      * <ul>
      * <li>0: System Counters</li>
-     * <li>1 - 5, 9: Stream Positions</li>
+     * <li>1 - 5, 9, 10: Stream Positions and Indicators</li>
      * <li>6 - 7: Channel Endpoint Status</li>
      * </ul>
      */
@@ -83,8 +93,6 @@ public class AeronStat
      * Channel filter to be used for position counters.
      */
     private static final String COUNTER_CHANNEL = "channel";
-
-    private static final int ONE_SECOND = 1_000;
 
     private final CountersReader counters;
     private final Pattern typeFilter;
@@ -142,6 +150,7 @@ public class AeronStat
 
     public static void main(final String[] args) throws Exception
     {
+        long delayMs = 1000L;
         Pattern typeFilter = null;
         Pattern identityFilter = null;
         Pattern sessionFilter = null;
@@ -166,6 +175,10 @@ public class AeronStat
 
                 switch (argName)
                 {
+                    case DELAY:
+                        delayMs = Long.parseLong(argValue) * 1000L;
+                        break;
+
                     case COUNTER_TYPE_ID:
                         typeFilter = Pattern.compile(argValue);
                         break;
@@ -200,7 +213,7 @@ public class AeronStat
 
         while (running.get())
         {
-            System.out.print("\033[H\033[2J");
+            clearScreen();
 
             System.out.format("%1$tH:%1$tM:%1$tS - Aeron Stat%n", new Date());
             System.out.println("=========================");
@@ -208,7 +221,7 @@ public class AeronStat
             aeronStat.print(System.out);
             System.out.println("--");
 
-            Thread.sleep(ONE_SECOND);
+            Thread.sleep(delayMs);
         }
     }
 
@@ -233,12 +246,13 @@ public class AeronStat
             {
                 System.out.format(
                     "Usage: [-Daeron.dir=<directory containing CnC file>] AeronStat%n" +
-                        "\tfilter by optional regex patterns:%n" +
-                        "\t[type=<pattern>]%n" +
-                        "\t[identity=<pattern>]%n" +
-                        "\t[sessionId=<pattern>]%n" +
-                        "\t[streamId=<pattern>]%n" +
-                        "\t[channel=<pattern>]%n");
+                    "\t[delay=<seconds between updates>]%n" +
+                    "filter by optional regex patterns:%n" +
+                    "\t[type=<pattern>]%n" +
+                    "\t[identity=<pattern>]%n" +
+                    "\t[sessionId=<pattern>]%n" +
+                    "\t[streamId=<pattern>]%n" +
+                    "\t[channel=<pattern>]%n");
 
                 System.exit(0);
             }
@@ -256,7 +270,8 @@ public class AeronStat
         {
             return false;
         }
-        else if ((typeId >= PUBLISHER_LIMIT_TYPE_ID && typeId <= RECEIVER_POS_TYPE_ID) || typeId == PER_IMAGE_TYPE_ID)
+        else if ((typeId >= PUBLISHER_LIMIT_TYPE_ID && typeId <= RECEIVER_POS_TYPE_ID) ||
+            typeId == SENDER_LIMIT_TYPE_ID || typeId == PER_IMAGE_TYPE_ID)
         {
             if (!match(identityFilter, () -> Long.toString(keyBuffer.getLong(REGISTRATION_ID_OFFSET))) ||
                 !match(sessionFilter, () -> Integer.toString(keyBuffer.getInt(SESSION_ID_OFFSET))) ||
@@ -280,5 +295,17 @@ public class AeronStat
     private static boolean match(final Pattern pattern, final Supplier<String> supplier)
     {
         return null == pattern || pattern.matcher(supplier.get()).find();
+    }
+
+    private static void clearScreen() throws Exception
+    {
+        if (SystemUtil.osName().contains("win"))
+        {
+            new ProcessBuilder("cmd", "/c", "cls").inheritIO().start().waitFor();
+        }
+        else
+        {
+            System.out.print(ANSI_CLS + ANSI_HOME);
+        }
     }
 }

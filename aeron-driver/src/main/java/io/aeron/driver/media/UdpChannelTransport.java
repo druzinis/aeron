@@ -16,8 +16,9 @@
 package io.aeron.driver.media;
 
 import io.aeron.driver.Configuration;
-import io.aeron.driver.status.ChannelEndpointStatus;
+import io.aeron.status.ChannelEndpointStatus;
 import io.aeron.protocol.HeaderFlyweight;
+import org.agrona.CloseHelper;
 import org.agrona.LangUtil;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.errors.DistinctErrorLog;
@@ -75,10 +76,9 @@ public abstract class UdpChannelTransport implements AutoCloseable
         {
             sendDatagramChannel = DatagramChannel.open(udpChannel.protocolFamily());
             receiveDatagramChannel = sendDatagramChannel;
+
             if (udpChannel.isMulticast())
             {
-                final NetworkInterface localInterface = udpChannel.localInterface();
-
                 if (null != connectAddress)
                 {
                     receiveDatagramChannel = DatagramChannel.open(udpChannel.protocolFamily());
@@ -86,28 +86,23 @@ public abstract class UdpChannelTransport implements AutoCloseable
 
                 receiveDatagramChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
                 receiveDatagramChannel.bind(new InetSocketAddress(endPointAddress.getPort()));
-                receiveDatagramChannel.join(endPointAddress.getAddress(), localInterface);
-                sendDatagramChannel.setOption(StandardSocketOptions.IP_MULTICAST_IF, localInterface);
+                receiveDatagramChannel.join(endPointAddress.getAddress(), udpChannel.localInterface());
+                sendDatagramChannel.setOption(StandardSocketOptions.IP_MULTICAST_IF, udpChannel.localInterface());
 
                 if (0 != udpChannel.multicastTtl())
                 {
                     sendDatagramChannel.setOption(StandardSocketOptions.IP_MULTICAST_TTL, udpChannel.multicastTtl());
-                    multicastTtl = getOption(StandardSocketOptions.IP_MULTICAST_TTL);
-                }
-
-                if (null != connectAddress)
-                {
-                    sendDatagramChannel.connect(connectAddress);
+                    multicastTtl = sendDatagramChannel.getOption(StandardSocketOptions.IP_MULTICAST_TTL);
                 }
             }
             else
             {
                 sendDatagramChannel.bind(bindAddress);
+            }
 
-                if (null != connectAddress)
-                {
-                    sendDatagramChannel.connect(connectAddress);
-                }
+            if (null != connectAddress)
+            {
+                sendDatagramChannel.connect(connectAddress);
             }
 
             if (0 != Configuration.SOCKET_SNDBUF_LENGTH)
@@ -126,7 +121,18 @@ public abstract class UdpChannelTransport implements AutoCloseable
         catch (final IOException ex)
         {
             statusIndicator.setOrdered(ChannelEndpointStatus.ERRORED);
-            throw new RuntimeException("Erroneous channel: " + udpChannel.originalUriString(), ex);
+
+            CloseHelper.quietClose(sendDatagramChannel);
+            if (receiveDatagramChannel != sendDatagramChannel)
+            {
+                CloseHelper.quietClose(receiveDatagramChannel);
+            }
+
+            sendDatagramChannel = null;
+            receiveDatagramChannel = null;
+
+            throw new RuntimeException(
+                "Channel error: " + ex.getMessage() + " : " + udpChannel.originalUriString(), ex);
         }
     }
 
@@ -266,27 +272,5 @@ public abstract class UdpChannelTransport implements AutoCloseable
         }
 
         return address;
-    }
-
-    /**
-     * Return socket option value
-     *
-     * @param socketOption of the socket option
-     * @param <T>          type of option
-     * @return option value
-     */
-    protected <T> T getOption(final SocketOption<T> socketOption)
-    {
-        T option = null;
-        try
-        {
-            option = sendDatagramChannel.getOption(socketOption);
-        }
-        catch (final IOException ex)
-        {
-            LangUtil.rethrowUnchecked(ex);
-        }
-
-        return option;
     }
 }

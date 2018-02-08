@@ -30,7 +30,7 @@
 #include "util/aeron_netutil.h"
 #include "aeron_udp_channel_transport.h"
 
-#if !defined(HAVE_RECVMMSG)
+#if !defined(HAVE_STRUCT_MMSGHDR)
 struct mmsghdr
 {
     struct msghdr msg_hdr;
@@ -95,16 +95,20 @@ int aeron_udp_channel_transport_init(
         }
 #endif
 
-        if (bind(transport->fd, (struct sockaddr *) bind_addr, bind_addr_len) < 0)
-        {
-            int errcode = errno;
-
-            aeron_set_err(errcode, "multicast bind: %s", strerror(errcode));
-            goto error;
-        }
-
         if (is_ipv6)
         {
+            struct sockaddr_in6 addr;
+            memcpy(&addr, bind_addr, sizeof(addr));
+            addr.sin6_addr = in6addr_any;
+
+            if (bind(transport->fd, (struct sockaddr *) &addr, bind_addr_len) < 0)
+            {
+                int errcode = errno;
+
+                aeron_set_err(errcode, "multicast IPv6 bind: %s", strerror(errcode));
+                goto error;
+            }
+
             struct ipv6_mreq mreq;
 
             memcpy(&mreq.ipv6mr_multiaddr, &in6->sin6_addr, sizeof(in6->sin6_addr));
@@ -140,8 +144,20 @@ int aeron_udp_channel_transport_init(
         }
         else
         {
+            struct sockaddr_in addr;
+            memcpy(&addr, bind_addr, sizeof(addr));
+            addr.sin_addr.s_addr = INADDR_ANY;
+
+            if (bind(transport->fd, (struct sockaddr *) &addr, bind_addr_len) < 0)
+            {
+                int errcode = errno;
+
+                aeron_set_err(errcode, "multicast IPv4 bind: %s", strerror(errcode));
+                goto error;
+            }
+
             struct ip_mreq mreq;
-            struct sockaddr_in *interface_addr = (struct sockaddr_in *) &multicast_if_addr;
+            struct sockaddr_in *interface_addr = (struct sockaddr_in *) multicast_if_addr;
 
             mreq.imr_multiaddr.s_addr = in4->sin_addr.s_addr;
             mreq.imr_interface.s_addr = interface_addr->sin_addr.s_addr;
@@ -154,7 +170,7 @@ int aeron_udp_channel_transport_init(
                 goto error;
             }
 
-            if (setsockopt(transport->fd, IPPROTO_IP, IP_MULTICAST_IF, interface_addr, sizeof(struct in_addr)) < 0)
+            if (setsockopt(transport->fd, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr->sin_addr, sizeof(struct in_addr)) < 0)
             {
                 int errcode = errno;
 
@@ -288,7 +304,7 @@ int aeron_udp_channel_transport_recvmmsg(
 
             if (EINTR == err || EAGAIN == err)
             {
-                return 0;
+                break;
             }
 
             aeron_set_err(err, "recvmsg: %s", strerror(err));
@@ -318,7 +334,7 @@ int aeron_udp_channel_transport_sendmmsg(
     struct mmsghdr *msgvec,
     size_t vlen)
 {
-#if defined(HAVE_RECVMMSG)
+#if defined(HAVE_SENDMMSG)
     int sendmmsg_result = sendmmsg(transport->fd, msgvec, vlen, 0);
     if (sendmmsg_result < 0)
     {
@@ -365,4 +381,19 @@ int aeron_udp_channel_transport_sendmsg(
     }
 
     return (int)sendmsg_result;
+}
+
+int aeron_udp_channel_transport_get_so_rcvbuf(aeron_udp_channel_transport_t *transport, size_t *so_rcvbuf)
+{
+    socklen_t len = sizeof(size_t);
+
+    if (getsockopt(transport->fd, SOL_SOCKET, SO_RCVBUF, so_rcvbuf, &len) < 0)
+    {
+        int errcode = errno;
+
+        aeron_set_err(errcode, "getsockopt(SO_RCVBUF) %s:%d: %s", __FILE__, __LINE__, strerror(errcode));
+        return -1;
+    }
+
+    return 0;
 }

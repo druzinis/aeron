@@ -65,7 +65,7 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddAndRemoveSingleIpcPublication)
     {
         ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
 
-        const command::CorrelatedMessageFlyweight response(buffer, offset);
+        const command::OperationSucceededFlyweight response(buffer, offset);
 
         EXPECT_EQ(response.correlationId(), remove_correlation_id);
     };
@@ -84,9 +84,9 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddSingleIpcSubscription)
 
     auto handler = [&](std::int32_t msgTypeId, AtomicBuffer& buffer, util::index_t offset, util::index_t length)
     {
-        ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+        ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-        const command::CorrelatedMessageFlyweight response(buffer, offset);
+        const command::SubscriptionReadyFlyweight response(buffer, offset);
 
         EXPECT_EQ(response.correlationId(), sub_id);
     };
@@ -111,7 +111,7 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddAndRemoveSingleIpcSubscription)
     {
         ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
 
-        const command::CorrelatedMessageFlyweight response(buffer, offset);
+        const command::OperationSucceededFlyweight response(buffer, offset);
 
         EXPECT_EQ(response.correlationId(), remove_correlation_id);
     };
@@ -221,9 +221,9 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddSingleIpcSubscriptionThenAddSing
     {
         if (0 == response_number)
         {
-            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-            const command::CorrelatedMessageFlyweight response(buffer, offset);
+            const command::SubscriptionReadyFlyweight response(buffer, offset);
 
             EXPECT_EQ(response.correlationId(), sub_id);
         }
@@ -291,9 +291,9 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddSingleIpcPublicationThenAddSingl
         }
         else if (1 == response_number)
         {
-            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-            const command::CorrelatedMessageFlyweight response(buffer, offset);
+            const command::SubscriptionReadyFlyweight response(buffer, offset);
 
             EXPECT_EQ(response.correlationId(), sub_id);
         }
@@ -340,17 +340,17 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddMultipleIpcSubscriptionWithSameS
     {
         if (0 == response_number)
         {
-            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-            const command::CorrelatedMessageFlyweight response(buffer, offset);
+            const command::SubscriptionReadyFlyweight response(buffer, offset);
 
             EXPECT_EQ(response.correlationId(), sub_id_1);
         }
         else if (1 == response_number)
         {
-            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-            const command::CorrelatedMessageFlyweight response(buffer, offset);
+            const command::SubscriptionReadyFlyweight response(buffer, offset);
 
             EXPECT_EQ(response.correlationId(), sub_id_2);
         }
@@ -414,9 +414,9 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToAddSingleIpcSubscriptionThenAddMult
     {
         if (0 == response_number)
         {
-            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-            const command::CorrelatedMessageFlyweight response(buffer, offset);
+            const command::SubscriptionReadyFlyweight response(buffer, offset);
 
             EXPECT_EQ(response.correlationId(), sub_id);
         }
@@ -499,9 +499,9 @@ TEST_F(DriverConductorIpcTest, shouldNotLinkSubscriptionOnAddPublicationAfterFir
     {
         if (0 == response_number)
         {
-            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_OPERATION_SUCCESS);
+            ASSERT_EQ(msgTypeId, AERON_RESPONSE_ON_SUBSCRIPTION_READY);
 
-            const command::CorrelatedMessageFlyweight response(buffer, offset);
+            const command::SubscriptionReadyFlyweight response(buffer, offset);
 
             EXPECT_EQ(response.correlationId(), sub_id);
         }
@@ -606,6 +606,27 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToTimeoutIpcSubscription)
     EXPECT_EQ(aeron_driver_conductor_num_ipc_subscriptions(&m_conductor.m_conductor), 0u);
 }
 
+TEST_F(DriverConductorIpcTest, shouldBeAbleToTimeoutMultipleIpcSubscriptions)
+{
+    int64_t client_id = nextCorrelationId();
+    int64_t sub_id1 = nextCorrelationId();
+    int64_t sub_id2 = nextCorrelationId();
+    int64_t sub_id3 = nextCorrelationId();
+
+    ASSERT_EQ(addIpcSubscription(client_id, sub_id1, STREAM_ID_1, false), 0);
+    ASSERT_EQ(addIpcSubscription(client_id, sub_id2, STREAM_ID_2, false), 0);
+    ASSERT_EQ(addIpcSubscription(client_id, sub_id3, STREAM_ID_3, false), 0);
+    doWork();
+    EXPECT_EQ(aeron_driver_conductor_num_ipc_subscriptions(&m_conductor.m_conductor), 3u);
+    EXPECT_EQ(readAllBroadcastsFromConductor(null_handler), 3u);
+
+    doWorkUntilTimeNs(
+        m_context.m_context->publication_linger_timeout_ns +
+            (m_context.m_context->client_liveness_timeout_ns * 2));
+    EXPECT_EQ(aeron_driver_conductor_num_clients(&m_conductor.m_conductor), 0u);
+    EXPECT_EQ(aeron_driver_conductor_num_ipc_subscriptions(&m_conductor.m_conductor), 0u);
+}
+
 TEST_F(DriverConductorIpcTest, shouldBeAbleToNotTimeoutIpcSubscriptionOnKeepalive)
 {
     int64_t client_id = nextCorrelationId();
@@ -667,6 +688,7 @@ TEST_F(DriverConductorIpcTest, shouldBeAbleToTimeoutIpcPublicationWithActiveIpcS
         const command::ImageMessageFlyweight response(buffer, offset);
 
         EXPECT_EQ(response.correlationId(), pub_id);
+        EXPECT_EQ(response.subscriptionRegistrationId(), sub_id);
         EXPECT_EQ(response.streamId(), STREAM_ID_1);
         EXPECT_EQ(response.channel(), AERON_IPC_CHANNEL);
     };

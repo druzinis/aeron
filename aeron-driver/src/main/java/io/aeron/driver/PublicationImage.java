@@ -22,7 +22,6 @@ import io.aeron.driver.status.SystemCounters;
 import io.aeron.logbuffer.LogBufferDescriptor;
 import io.aeron.logbuffer.TermRebuilder;
 import io.aeron.protocol.DataHeaderFlyweight;
-import io.aeron.protocol.HeaderFlyweight;
 import io.aeron.protocol.RttMeasurementFlyweight;
 import org.agrona.collections.ArrayUtil;
 import org.agrona.concurrent.EpochClock;
@@ -36,7 +35,7 @@ import java.net.InetSocketAddress;
 
 import static io.aeron.driver.LossDetector.lossFound;
 import static io.aeron.driver.LossDetector.rebuildOffset;
-import static io.aeron.driver.PublicationImage.Status.ACTIVE;
+import static io.aeron.driver.PublicationImage.State.ACTIVE;
 import static io.aeron.driver.status.SystemCounterDescriptor.*;
 import static io.aeron.logbuffer.LogBufferDescriptor.*;
 import static io.aeron.logbuffer.TermGapFiller.tryFillGap;
@@ -62,12 +61,13 @@ class PublicationImagePadding2 extends PublicationImageConductorFields
     protected long p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27, p28, p29, p30;
 }
 
-class PublicationImageHotFields extends PublicationImagePadding2
+class PublicationImageReceiverFields extends PublicationImagePadding2
 {
+    protected boolean isEndOfStream = false;
     protected long lastPacketTimestampNs;
 }
 
-class PublicationImagePadding3 extends PublicationImageHotFields
+class PublicationImagePadding3 extends PublicationImageReceiverFields
 {
     @SuppressWarnings("unused")
     protected long p31, p32, p33, p34, p35, p36, p37, p38, p39, p40, p41, p42, p43, p44, p45;
@@ -80,12 +80,12 @@ public class PublicationImage
     extends PublicationImagePadding3
     implements LossHandler, DriverManagedResource, Subscribable
 {
-    enum Status
+    enum State
     {
-        INIT, ACTIVE, INACTIVE, LINGER
+        INIT, ACTIVE, INACTIVE, LINGER, DONE
     }
 
-    private long timeOfLastStatusChangeNs;
+    private long timeOfLastStateChangeNs;
     private long lastLossChangeNumber = -1;
     private long lastSmChangeNumber = -1;
 
@@ -100,7 +100,7 @@ public class PublicationImage
     private long nextSmPosition;
     private int nextSmReceiverWindowLength;
 
-    private long lastStatusMessageTimestamp;
+    private long timeOfLastStatusMessageNs;
 
     private final long correlationId;
     private final long imageLivenessTimeoutNs;
@@ -111,10 +111,11 @@ public class PublicationImage
     private final int initialTermId;
     private final boolean isReliable;
 
-    private boolean reachedEndOfLife = false;
-    private volatile Status status = Status.INIT;
+    private boolean noLongerActive;
+    private volatile State state = State.INIT;
 
     private final NanoClock nanoClock;
+    private final NanoClock cachedNanoClock;
     private final InetSocketAddress controlAddress;
     private final ReceiveChannelEndpoint channelEndpoint;
     private final UnsafeBuffer[] termBuffers;
@@ -129,7 +130,7 @@ public class PublicationImage
     private final AtomicCounter flowControlUnderRuns;
     private final AtomicCounter flowControlOverRuns;
     private final AtomicCounter lossGapFills;
-    private final EpochClock epochClock;
+    private final EpochClock cachedEpochClock;
     private final RawLog rawLog;
 
     public PublicationImage(
@@ -148,7 +149,8 @@ public class PublicationImage
         final Position hwmPosition,
         final Position rebuildPosition,
         final NanoClock nanoClock,
-        final EpochClock epochClock,
+        final NanoClock cachedNanoClock,
+        final EpochClock cachedEpochClock,
         final SystemCounters systemCounters,
         final InetSocketAddress sourceAddress,
         final CongestionControl congestionControl,
@@ -179,9 +181,10 @@ public class PublicationImage
         lossGapFills = systemCounters.get(LOSS_GAP_FILLS);
 
         this.nanoClock = nanoClock;
-        this.epochClock = epochClock;
-        final long nowNs = nanoClock.nanoTime();
-        timeOfLastStatusChangeNs = nowNs;
+        this.cachedNanoClock = cachedNanoClock;
+        this.cachedEpochClock = cachedEpochClock;
+        final long nowNs = cachedNanoClock.nanoTime();
+        timeOfLastStateChangeNs = nowNs;
         lastPacketTimestampNs = nowNs;
 
         termBuffers = rawLog.termBuffers();
@@ -189,7 +192,7 @@ public class PublicationImage
 
         final int termLength = rawLog.termLength();
         termLengthMask = termLength - 1;
-        positionBitsToShift = Integer.numberOfTrailingZeros(termLength);
+        positionBitsToShift = LogBufferDescriptor.positionBitsToShift(termLength);
 
         final long initialPosition = computePosition(
             activeTermId, initialTermOffset, positionBitsToShift, initialTermId);
@@ -247,21 +250,9 @@ public class PublicationImage
      *
      * @return the string representation of the channel URI.
      */
-    public String channelUriString()
+    public String channel()
     {
         return channelEndpoint.originalUriString();
-    }
-
-    /**
-     * Does this image match a given {@link ReceiveChannelEndpoint} and stream id?
-     *
-     * @param channelEndpoint to match by identity.
-     * @param streamId        to match on value.
-     * @return true on a match otherwise false.
-     */
-    public boolean matches(final ReceiveChannelEndpoint channelEndpoint, final int streamId)
-    {
-        return this.streamId == streamId && this.channelEndpoint == channelEndpoint;
     }
 
     /**
@@ -304,12 +295,12 @@ public class PublicationImage
 
         if (null != reportEntry)
         {
-            reportEntry.recordObservation(length, epochClock.time());
+            reportEntry.recordObservation(length, cachedEpochClock.time());
         }
         else if (null != lossReport)
         {
             reportEntry = lossReport.createEntry(
-                length, epochClock.time(), sessionId, streamId, channelUriString(), sourceAddress.toString());
+                length, cachedEpochClock.time(), sessionId, streamId, channel(), sourceAddress.toString());
 
             if (null == reportEntry)
             {
@@ -358,28 +349,17 @@ public class PublicationImage
     }
 
     /**
-     * Return status of the image. Retrieved by {@link DriverConductor}.
-     *
-     * @return status of the image
+     * Activate this image from the {@link Receiver}
      */
-    Status status()
+    void activate()
     {
-        return status;
+        state(ACTIVE);
     }
 
-    /**
-     * Set status of the image.
-     * <p>
-     * Set by {@link Receiver} for INIT to ACTIVE to INACTIVE
-     * <p>
-     * Set by {@link DriverConductor} for INACTIVE to LINGER
-     *
-     * @param status of the image
-     */
-    void status(final Status status)
+    private void state(final State state)
     {
-        timeOfLastStatusChangeNs = nanoClock.nanoTime();
-        this.status = status;
+        timeOfLastStateChangeNs = cachedNanoClock.nanoTime();
+        this.state = state;
     }
 
     private void scheduleStatusMessage(final long nowNs, final long smPosition, final int receiverWindowLength)
@@ -390,7 +370,7 @@ public class PublicationImage
 
         nextSmPosition = smPosition;
         nextSmReceiverWindowLength = receiverWindowLength;
-        lastStatusMessageTimestamp = nowNs;
+        timeOfLastStatusMessageNs = nowNs;
 
         endSmChange = changeNumber;
     }
@@ -398,11 +378,16 @@ public class PublicationImage
     /**
      * Called from the {@link DriverConductor}.
      *
-     * @param nowNs                in nanoseconds
-     * @param statusMessageTimeout for sending of Status Messages.
+     * @param nowNs                  in nanoseconds
+     * @param statusMessageTimeoutNs for sending of Status Messages.
      */
-    void trackRebuild(final long nowNs, final long statusMessageTimeout)
+    void trackRebuild(final long nowNs, final long statusMessageTimeoutNs)
     {
+        if (noLongerActive)
+        {
+            return;
+        }
+
         long minSubscriberPosition = Long.MAX_VALUE;
         long maxSubscriberPosition = Long.MIN_VALUE;
 
@@ -442,7 +427,7 @@ public class PublicationImage
         final long threshold = CongestionControlUtil.positionThreshold(window);
 
         if (CongestionControlUtil.shouldForceStatusMessage(ccOutcome) ||
-            (nowNs > (lastStatusMessageTimestamp + statusMessageTimeout)) ||
+            (nowNs > (timeOfLastStatusMessageNs + statusMessageTimeoutNs)) ||
             (minSubscriberPosition > (nextSmPosition + threshold)))
         {
             scheduleStatusMessage(nowNs, minSubscriberPosition, window);
@@ -451,13 +436,13 @@ public class PublicationImage
     }
 
     /**
-     * Set status to INACTIVE, but only if currently ACTIVE. Set by {@link Receiver}.
+     * Set state to {@link State#INACTIVE} if currently {@link State#ACTIVE}. Set by {@link Receiver}.
      */
     void ifActiveGoInactive()
     {
-        if (Status.ACTIVE == status)
+        if (State.ACTIVE == state)
         {
-            status(Status.INACTIVE);
+            state(State.INACTIVE);
         }
     }
 
@@ -472,7 +457,7 @@ public class PublicationImage
      */
     int insertPacket(final int termId, final int termOffset, final UnsafeBuffer buffer, final int length)
     {
-        final boolean isHeartbeat = isHeartbeat(buffer, length);
+        final boolean isHeartbeat = DataHeaderFlyweight.isHeartbeat(buffer, length);
         final long packetPosition = computePosition(termId, termOffset, positionBitsToShift, initialTermId);
         final long proposedPosition = isHeartbeat ? packetPosition : packetPosition + length;
         final long windowPosition = nextSmPosition;
@@ -482,12 +467,13 @@ public class PublicationImage
         {
             if (isHeartbeat)
             {
-                if (isEndOfStream(buffer))
+                if (!isEndOfStream && DataHeaderFlyweight.isEndOfStream(buffer))
                 {
+                    isEndOfStream = true;
                     LogBufferDescriptor.endOfStreamPosition(rawLog.metaData(), packetPosition);
                 }
 
-                heartbeatsReceived.orderedIncrement();
+                heartbeatsReceived.incrementOrdered();
             }
             else
             {
@@ -495,28 +481,30 @@ public class PublicationImage
                 TermRebuilder.insert(termBuffer, termOffset, buffer, length);
             }
 
-            hwmCandidate(proposedPosition);
+            lastPacketTimestampNs = cachedNanoClock.nanoTime();
+            hwmPosition.proposeMaxOrdered(proposedPosition);
         }
 
         return length;
     }
 
     /**
-     * To be called from the {@link Receiver} to see if a image should be garbage collected.
+     * To be called from the {@link Receiver} to see if a image should be retained.
      *
-     * @param nowNs current time to check against.
-     * @return true if still active otherwise false.
+     * @param nowNs current time to check against for activity.
+     * @return true if the image should be retained otherwise false.
      */
-    boolean checkForActivity(final long nowNs)
+    boolean hasActivityAndNotEndOfStream(final long nowNs)
     {
-        boolean activity = true;
+        boolean isActive = true;
 
-        if (nowNs > (lastPacketTimestampNs + imageLivenessTimeoutNs))
+        if (nowNs > (lastPacketTimestampNs + imageLivenessTimeoutNs) ||
+            (isEndOfStream && rebuildPosition.getVolatile() >= hwmPosition.get()))
         {
-            activity = false;
+            isActive = false;
         }
 
-        return activity;
+        return isActive;
     }
 
     /**
@@ -528,7 +516,7 @@ public class PublicationImage
     {
         int workCount = 0;
 
-        if (ACTIVE == status)
+        if (ACTIVE == state)
         {
             final long changeNumber = endSmChange;
 
@@ -547,11 +535,12 @@ public class PublicationImage
                     channelEndpoint.sendStatusMessage(
                         controlAddress, sessionId, streamId, termId, termOffset, receiverWindowLength, (byte)0);
 
-                    statusMessagesSent.orderedIncrement();
+                    statusMessagesSent.incrementOrdered();
 
                     lastSmChangeNumber = changeNumber;
-                    workCount = 1;
                 }
+
+                workCount = 1;
             }
         }
 
@@ -581,20 +570,21 @@ public class PublicationImage
                 if (isReliable)
                 {
                     channelEndpoint.sendNakMessage(controlAddress, sessionId, streamId, termId, termOffset, length);
-                    nakMessagesSent.orderedIncrement();
+                    nakMessagesSent.incrementOrdered();
                 }
                 else
                 {
                     final UnsafeBuffer termBuffer = termBuffers[indexByTerm(initialTermId, termId)];
                     if (tryFillGap(rawLog.metaData(), termBuffer, termId, termOffset, length))
                     {
-                        lossGapFills.orderedIncrement();
+                        lossGapFills.incrementOrdered();
                     }
                 }
 
                 lastLossChangeNumber = changeNumber;
-                workCount = 1;
             }
+
+            workCount = 1;
         }
 
         return workCount;
@@ -612,7 +602,11 @@ public class PublicationImage
 
         if (congestionControl.shouldMeasureRtt(nowNs))
         {
-            channelEndpoint.sendRttMeasurement(controlAddress, sessionId, streamId, nowNs, 0, true);
+            final long preciseTimeNs = nanoClock.nanoTime();
+
+            channelEndpoint.sendRttMeasurement(controlAddress, sessionId, streamId, preciseTimeNs, 0, true);
+            congestionControl.onRttMeasurementSent(preciseTimeNs);
+
             workCount = 1;
         }
 
@@ -640,7 +634,7 @@ public class PublicationImage
      */
     boolean isAcceptingSubscriptions()
     {
-        return subscriberPositions.length > 0 && status == ACTIVE;
+        return subscriberPositions.length > 0 && state == ACTIVE;
     }
 
     /**
@@ -655,20 +649,22 @@ public class PublicationImage
 
     public void onTimeEvent(final long timeNs, final long timesMs, final DriverConductor conductor)
     {
-        switch (status)
+        switch (state)
         {
             case INACTIVE:
-                if (isDrained() || timeNs > (timeOfLastStatusChangeNs + imageLivenessTimeoutNs))
+                if (isDrained() || timeNs > (timeOfLastStateChangeNs + imageLivenessTimeoutNs))
                 {
-                    status(PublicationImage.Status.LINGER);
+                    state = State.LINGER;
+                    timeOfLastStateChangeNs = timeNs;
                     conductor.transitionToLinger(this);
                 }
+                noLongerActive = true;
                 break;
 
             case LINGER:
-                if (timeNs > (timeOfLastStatusChangeNs + imageLivenessTimeoutNs))
+                if (timeNs > (timeOfLastStateChangeNs + imageLivenessTimeoutNs))
                 {
-                    reachedEndOfLife = true;
+                    state = State.DONE;
                     conductor.cleanupImage(this);
                 }
                 break;
@@ -677,21 +673,7 @@ public class PublicationImage
 
     public boolean hasReachedEndOfLife()
     {
-        return reachedEndOfLife;
-    }
-
-    public void timeOfLastStateChange(final long time)
-    {
-    }
-
-    public long timeOfLastStateChange()
-    {
-        return timeOfLastStatusChangeNs;
-    }
-
-    public void delete()
-    {
-        close();
+        return State.DONE == state;
     }
 
     private boolean isDrained()
@@ -709,31 +691,13 @@ public class PublicationImage
         return true;
     }
 
-    private boolean isHeartbeat(final UnsafeBuffer packet, final int length)
-    {
-        return length == DataHeaderFlyweight.HEADER_LENGTH && packet.getInt(0) == 0;
-    }
-
-    private boolean isEndOfStream(final UnsafeBuffer packet)
-    {
-        return
-            (DataHeaderFlyweight.BEGIN_END_AND_EOS_FLAGS ==
-                (packet.getByte(HeaderFlyweight.FLAGS_FIELD_OFFSET) & 0xFF));
-    }
-
-    private void hwmCandidate(final long proposedPosition)
-    {
-        lastPacketTimestampNs = nanoClock.nanoTime();
-        hwmPosition.proposeMaxOrdered(proposedPosition);
-    }
-
     private boolean isFlowControlUnderRun(final long windowPosition, final long packetPosition)
     {
         final boolean isFlowControlUnderRun = packetPosition < windowPosition;
 
         if (isFlowControlUnderRun)
         {
-            flowControlUnderRuns.orderedIncrement();
+            flowControlUnderRuns.incrementOrdered();
         }
 
         return isFlowControlUnderRun;
@@ -745,7 +709,7 @@ public class PublicationImage
 
         if (isFlowControlOverRun)
         {
-            flowControlOverRuns.orderedIncrement();
+            flowControlOverRuns.incrementOrdered();
         }
 
         return isFlowControlOverRun;

@@ -16,6 +16,7 @@
 package io.aeron;
 
 import io.aeron.command.*;
+import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.ringbuffer.RingBuffer;
 
@@ -44,9 +45,10 @@ public class DriverProxy
     private final RemoveMessageFlyweight removeMessage = new RemoveMessageFlyweight();
     private final CorrelatedMessageFlyweight correlatedMessage = new CorrelatedMessageFlyweight();
     private final DestinationMessageFlyweight destinationMessage = new DestinationMessageFlyweight();
+    private final CounterMessageFlyweight counterMessage = new CounterMessageFlyweight();
     private final RingBuffer toDriverCommandBuffer;
 
-    public DriverProxy(final RingBuffer toDriverCommandBuffer)
+    public DriverProxy(final RingBuffer toDriverCommandBuffer, final long clientId)
     {
         this.toDriverCommandBuffer = toDriverCommandBuffer;
 
@@ -55,8 +57,8 @@ public class DriverProxy
         correlatedMessage.wrap(buffer, 0);
         removeMessage.wrap(buffer, 0);
         destinationMessage.wrap(buffer, 0);
+        counterMessage.wrap(buffer, 0);
 
-        final long clientId = toDriverCommandBuffer.nextCorrelationId();
         correlatedMessage.clientId(clientId);
     }
 
@@ -189,6 +191,79 @@ public class DriverProxy
         if (!toDriverCommandBuffer.write(REMOVE_DESTINATION, buffer, 0, destinationMessage.length()))
         {
             throw new IllegalStateException("Could not write destination command");
+        }
+
+        return correlationId;
+    }
+
+    public long addCounter(
+        final int typeId,
+        final DirectBuffer keyBuffer,
+        final int keyOffset,
+        final int keyLength,
+        final DirectBuffer labelBuffer,
+        final int labelOffset,
+        final int labelLength)
+    {
+        final long correlationId = toDriverCommandBuffer.nextCorrelationId();
+
+        counterMessage
+            .typeId(typeId)
+            .keyBuffer(keyBuffer, keyOffset, keyLength)
+            .labelBuffer(labelBuffer, labelOffset, labelLength)
+            .correlationId(correlationId);
+
+        if (!toDriverCommandBuffer.write(ADD_COUNTER, buffer, 0, counterMessage.length()))
+        {
+            throw new IllegalStateException("Could not write add counter command");
+        }
+
+        return correlationId;
+    }
+
+    public long addCounter(final int typeId, final String label)
+    {
+        final long correlationId = toDriverCommandBuffer.nextCorrelationId();
+
+        counterMessage
+            .typeId(typeId)
+            .keyBuffer(null, 0, 0)
+            .label(label)
+            .correlationId(correlationId);
+
+        if (!toDriverCommandBuffer.write(ADD_COUNTER, buffer, 0, counterMessage.length()))
+        {
+            throw new IllegalStateException("Could not write add counter command");
+        }
+
+        return correlationId;
+    }
+
+    public long removeCounter(final long registrationId)
+    {
+        final long correlationId = toDriverCommandBuffer.nextCorrelationId();
+
+        removeMessage
+            .registrationId(registrationId)
+            .correlationId(correlationId);
+
+        if (!toDriverCommandBuffer.write(REMOVE_COUNTER, buffer, 0, RemoveMessageFlyweight.length()))
+        {
+            throw new IllegalStateException("Could not write remove counter command");
+        }
+
+        return correlationId;
+    }
+
+    public long clientClose()
+    {
+        final long correlationId = toDriverCommandBuffer.nextCorrelationId();
+
+        correlatedMessage.correlationId(correlationId);
+
+        if (!toDriverCommandBuffer.write(CLIENT_CLOSE, buffer, 0, CorrelatedMessageFlyweight.LENGTH))
+        {
+            throw new IllegalStateException("Could not send client close command");
         }
 
         return correlationId;

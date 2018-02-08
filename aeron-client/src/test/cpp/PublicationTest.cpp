@@ -22,6 +22,7 @@ using namespace aeron::concurrent;
 using namespace aeron;
 
 #define TERM_LENGTH (LogBufferDescriptor::TERM_MIN_LENGTH)
+#define PAGE_SIZE (LogBufferDescriptor::PAGE_MIN_SIZE)
 #define LOG_META_DATA_LENGTH (LogBufferDescriptor::LOG_META_DATA_LENGTH)
 #define SRC_BUFFER_LENGTH 1024
 
@@ -54,8 +55,9 @@ class PublicationTest : public testing::Test, public ClientConductorFixture
 public:
     PublicationTest() :
         m_srcBuffer(m_src, 0),
-        m_logBuffers(new LogBuffers(m_log.data(), static_cast<index_t>(m_log.size()))),
-        m_publicationLimit(m_counterValuesBuffer, PUBLICATION_LIMIT_COUNTER_ID)
+        m_logBuffers(new LogBuffers(m_log.data(), static_cast<std::int64_t>(m_log.size()), TERM_LENGTH)),
+        m_publicationLimit(m_counterValuesBuffer, PUBLICATION_LIMIT_COUNTER_ID),
+        m_channelStatusIndicator(m_counterValuesBuffer, ChannelEndpointStatus::NO_ID_ALLOCATED)
     {
         m_log.fill(0);
 
@@ -67,17 +69,22 @@ public:
         m_logMetaDataBuffer = m_logBuffers->atomicBuffer(LogBufferDescriptor::LOG_META_DATA_SECTION_INDEX);
 
         m_logMetaDataBuffer.putInt32(LogBufferDescriptor::LOG_MTU_LENGTH_OFFSET, (3 * m_srcBuffer.capacity()));
+        m_logMetaDataBuffer.putInt32(LogBufferDescriptor::LOG_TERM_LENGTH_OFFSET, TERM_LENGTH);
+        m_logMetaDataBuffer.putInt32(LogBufferDescriptor::LOG_PAGE_SIZE_OFFSET, PAGE_SIZE);
         m_logMetaDataBuffer.putInt32(LogBufferDescriptor::LOG_INITIAL_TERM_ID_OFFSET, TERM_ID_1);
 
-        const std::int32_t index = LogBufferDescriptor::indexByTerm(TERM_ID_1, TERM_ID_1);
+        m_logMetaDataBuffer.putInt32(LogBufferDescriptor::LOG_ACTIVE_TERM_COUNT_OFFSET, 0);
 
-        m_logMetaDataBuffer.putInt32(LogBufferDescriptor::LOG_ACTIVE_PARTITION_INDEX_OFFSET, index);
-
-        m_logMetaDataBuffer.putInt64(termTailCounterOffset(index), static_cast<std::int64_t>(TERM_ID_1) << 32);
+        m_logMetaDataBuffer.putInt64(termTailCounterOffset(0), static_cast<std::int64_t>(TERM_ID_1) << 32);
+        for (int i = 1; i < LogBufferDescriptor::PARTITION_COUNT; i++)
+        {
+            const std::int32_t expectedTermId = (TERM_ID_1 + i) - LogBufferDescriptor::PARTITION_COUNT;
+            m_logMetaDataBuffer.putInt64(termTailCounterOffset(i), static_cast<std::int64_t>(expectedTermId) << 32);
+        }
 
         m_publication = std::unique_ptr<Publication>(new Publication(
             m_conductor, CHANNEL, CORRELATION_ID, ORIGINAL_REGISTRATION_ID,
-            STREAM_ID, SESSION_ID, m_publicationLimit, m_logBuffers));
+            STREAM_ID, SESSION_ID, m_publicationLimit, m_channelStatusIndicator, m_logBuffers));
     }
 
 protected:
@@ -90,6 +97,7 @@ protected:
 
     std::shared_ptr<LogBuffers> m_logBuffers;
     UnsafeBufferPosition m_publicationLimit;
+    StatusIndicatorReader m_channelStatusIndicator;
     std::unique_ptr<Publication> m_publication;
 };
 
@@ -110,13 +118,13 @@ TEST_F(PublicationTest, shouldReportCorrectTermBufferLength)
 
 TEST_F(PublicationTest, shouldReportThatPublicationHasNotBeenConnectedYet)
 {
-    LogBufferDescriptor::timeOfLastStatusMessage(m_logMetaDataBuffer, m_currentTime - PUBLICATION_CONNECTION_TIMEOUT_MS - 1);
+    LogBufferDescriptor::isConnected(m_logMetaDataBuffer, false);
     EXPECT_FALSE(m_publication->isConnected());
 }
 
 TEST_F(PublicationTest, shouldReportThatPublicationHasBeenConnectedYet)
 {
-    LogBufferDescriptor::timeOfLastStatusMessage(m_logMetaDataBuffer, m_currentTime);
+    LogBufferDescriptor::isConnected(m_logMetaDataBuffer, true);
     EXPECT_TRUE(m_publication->isConnected());
 }
 
@@ -171,7 +179,7 @@ TEST_F(PublicationTest, shouldFailToOfferWhenAppendFails)
 
 TEST_F(PublicationTest, shouldRotateWhenAppendTrips)
 {
-    const int activeIndex = LogBufferDescriptor::indexByTerm(TERM_ID_1, TERM_ID_1);
+    const int activeIndex = LogBufferDescriptor::indexByTermCount(0);
     const std::int64_t initialPosition = TERM_LENGTH - DataFrameHeader::LENGTH;
     m_logMetaDataBuffer.putInt64(termTailCounterOffset(activeIndex), rawTailValue(TERM_ID_1, initialPosition));
     m_publicationLimit.set(LONG_MAX);
@@ -179,10 +187,10 @@ TEST_F(PublicationTest, shouldRotateWhenAppendTrips)
     EXPECT_EQ(m_publication->position(), initialPosition);
     EXPECT_EQ(m_publication->offer(m_srcBuffer), ADMIN_ACTION);
 
-    const int nextIndex = LogBufferDescriptor::indexByTerm(TERM_ID_1, TERM_ID_1 + 1);
-    EXPECT_EQ(m_logMetaDataBuffer.getInt32(LogBufferDescriptor::LOG_ACTIVE_PARTITION_INDEX_OFFSET), nextIndex);
+    const int nextIndex = LogBufferDescriptor::indexByTermCount(1);
+    EXPECT_EQ(m_logMetaDataBuffer.getInt32(LogBufferDescriptor::LOG_ACTIVE_TERM_COUNT_OFFSET), 1);
 
-    EXPECT_EQ(m_logMetaDataBuffer.getInt64(termTailCounterOffset(nextIndex)), static_cast<std::int64_t>(TERM_ID_1 + 1) << 32);
+    EXPECT_EQ(m_logMetaDataBuffer.getInt64(termTailCounterOffset(nextIndex)), (static_cast<std::int64_t>(TERM_ID_1 + 1)) << 32);
 
     EXPECT_GT(m_publication->offer(m_srcBuffer), initialPosition + DataFrameHeader::LENGTH + m_srcBuffer.capacity());
     EXPECT_GT(m_publication->position(), initialPosition + DataFrameHeader::LENGTH + m_srcBuffer.capacity());
@@ -190,7 +198,7 @@ TEST_F(PublicationTest, shouldRotateWhenAppendTrips)
 
 TEST_F(PublicationTest, shouldRotateWhenClaimTrips)
 {
-    const int activeIndex = LogBufferDescriptor::indexByTerm(TERM_ID_1, TERM_ID_1);
+    const int activeIndex = LogBufferDescriptor::indexByTermCount(0);
     const std::int64_t initialPosition = TERM_LENGTH - DataFrameHeader::LENGTH;
     m_logMetaDataBuffer.putInt64(termTailCounterOffset(activeIndex), rawTailValue(TERM_ID_1, initialPosition));
     m_publicationLimit.set(LONG_MAX);
@@ -199,10 +207,10 @@ TEST_F(PublicationTest, shouldRotateWhenClaimTrips)
     EXPECT_EQ(m_publication->position(), initialPosition);
     EXPECT_EQ(m_publication->tryClaim(SRC_BUFFER_LENGTH, bufferClaim), ADMIN_ACTION);
 
-    const int nextIndex = LogBufferDescriptor::indexByTerm(TERM_ID_1, TERM_ID_1 + 1);
-    EXPECT_EQ(m_logMetaDataBuffer.getInt32(LogBufferDescriptor::LOG_ACTIVE_PARTITION_INDEX_OFFSET), nextIndex);
+    const int nextIndex = LogBufferDescriptor::indexByTermCount(1);
+    EXPECT_EQ(m_logMetaDataBuffer.getInt32(LogBufferDescriptor::LOG_ACTIVE_TERM_COUNT_OFFSET), 1);
 
-    EXPECT_EQ(m_logMetaDataBuffer.getInt64(termTailCounterOffset(nextIndex)), static_cast<std::int64_t>(TERM_ID_1 + 1) << 32);
+    EXPECT_EQ(m_logMetaDataBuffer.getInt64(termTailCounterOffset(nextIndex)), (static_cast<std::int64_t>(TERM_ID_1 + 1)) << 32);
 
     EXPECT_GT(m_publication->tryClaim(SRC_BUFFER_LENGTH, bufferClaim), initialPosition + DataFrameHeader::LENGTH + m_srcBuffer.capacity());
     EXPECT_GT(m_publication->position(), initialPosition + DataFrameHeader::LENGTH + m_srcBuffer.capacity());

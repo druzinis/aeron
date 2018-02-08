@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class SimpleSubscriber
 {
-    public static void main(final String[] args) throws Exception
+    public static void main(final String[] args)
     {
         // Maximum number of message fragments to receive during a single 'poll' operation
         final int fragmentLimitCount = 10;
@@ -77,7 +77,7 @@ public class SimpleSubscriber
         // The Aeron and Subscription classes implement AutoCloseable, and will automatically
         // clean up resources when this try block is finished.
         try (Aeron aeron = Aeron.connect(ctx);
-             Subscription subscription = aeron.addSubscription(channel, streamId))
+            Subscription subscription = aeron.addSubscription(channel, streamId))
         {
             final IdleStrategy idleStrategy = new BackoffIdleStrategy(
                 100, 10, TimeUnit.MICROSECONDS.toNanos(1), TimeUnit.MICROSECONDS.toNanos(100));

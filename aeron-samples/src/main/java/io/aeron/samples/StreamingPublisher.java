@@ -76,7 +76,7 @@ public class StreamingPublisher
         // The Aeron and Publication classes implement AutoCloseable, and will automatically
         // clean up resources when this try block is finished.
         try (Aeron aeron = Aeron.connect(context);
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID))
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID))
         {
             final ContinueBarrier barrier = new ContinueBarrier("Execute again?");
 
@@ -115,7 +115,7 @@ public class StreamingPublisher
                 System.out.println(
                     "Done streaming. Back pressure ratio " + ((double)backPressureCount / NUMBER_OF_MESSAGES));
 
-                if (0 < LINGER_TIMEOUT_MS)
+                if (LINGER_TIMEOUT_MS > 0)
                 {
                     System.out.println("Lingering for " + LINGER_TIMEOUT_MS + " milliseconds...");
                     Thread.sleep(LINGER_TIMEOUT_MS);

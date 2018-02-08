@@ -15,6 +15,7 @@
  */
 
 #if defined(__linux__)
+#define _BSD_SOURCE
 #define _GNU_SOURCE
 #endif
 
@@ -41,7 +42,32 @@ static pthread_once_t agent_is_initialized = PTHREAD_ONCE_INIT;
 static aeron_mpsc_rb_t logging_mpsc_rb;
 static uint8_t *rb_buffer = NULL;
 static uint64_t mask = 0;
+static double receive_data_loss_rate = 0.0;
+static unsigned short receive_data_loss_xsubi[3];
 static pthread_t log_reader_thread;
+
+int64_t aeron_agent_epochclock()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
+    {
+        return -1;
+    }
+
+    return (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+bool aeron_agent_should_drop_frame(struct msghdr *message)
+{
+    aeron_frame_header_t *frame_header = (aeron_frame_header_t *)(message->msg_iov->iov_base);
+
+    if (frame_header->type == AERON_HDR_TYPE_DATA || frame_header->type == AERON_HDR_TYPE_PAD)
+    {
+        return erand48(receive_data_loss_xsubi) <= receive_data_loss_rate;
+    }
+
+    return false;
+}
 
 static void *aeron_driver_agent_log_reader(void *arg)
 {
@@ -59,6 +85,7 @@ static void *aeron_driver_agent_log_reader(void *arg)
 static void initialize_agent_logging()
 {
     char *mask_str = getenv(AERON_AGENT_MASK_ENV_VAR);
+    char *receive_loss_rate_str = getenv(AERON_AGENT_RECEIVE_DATA_LOSS_RATE_ENV_VAR);
 
     if (mask_str)
     {
@@ -73,6 +100,7 @@ static void initialize_agent_logging()
             fprintf(stderr, "could not allocate ring buffer buffer. exiting.\n");
             exit(EXIT_FAILURE);
         }
+        memset(rb_buffer, 0, rb_length);
 
         if (aeron_mpsc_rb_init(&logging_mpsc_rb, rb_buffer, rb_length) < 0)
         {
@@ -86,17 +114,30 @@ static void initialize_agent_logging()
             exit(EXIT_FAILURE);
         }
     }
-}
 
-int64_t aeron_agent_epochclock()
-{
-    struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
+    if (receive_loss_rate_str)
     {
-        return -1;
+        receive_data_loss_rate = strtod(receive_loss_rate_str, NULL);
     }
 
-    return (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    if (0.0 != receive_data_loss_rate)
+    {
+        char *receive_loss_seed_str = getenv(AERON_AGENT_RECEIVE_DATA_LOSS_SEED_ENV_VAR);
+        long seed_value;
+
+        if (receive_loss_seed_str)
+        {
+            seed_value = strtol(receive_loss_seed_str, NULL, 0);
+        }
+        else
+        {
+            seed_value = aeron_agent_epochclock();
+        }
+
+        receive_data_loss_xsubi[2] = (unsigned short)(seed_value & 0xFFFF);
+        receive_data_loss_xsubi[1] = (unsigned short)((seed_value >> 16) & 0xFFFF);
+        receive_data_loss_xsubi[0] = (unsigned short)((seed_value >> 32) & 0xFFFF);
+    }
 }
 
 void aeron_driver_agent_conductor_to_driver_interceptor(
@@ -121,6 +162,45 @@ void aeron_driver_agent_conductor_to_client_interceptor(
     memcpy(buffer + sizeof(aeron_driver_agent_cmd_log_header_t), message, length);
 
     aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_CMD_OUT, buffer, length + sizeof(aeron_driver_agent_cmd_log_header_t));
+}
+
+int aeron_driver_agent_map_raw_log_interceptor(
+    aeron_mapped_raw_log_t *mapped_raw_log,
+    const char *path,
+    bool use_sparse_files,
+    uint64_t term_length,
+    uint64_t page_size)
+{
+    int result = aeron_map_raw_log(mapped_raw_log, path, use_sparse_files, term_length, page_size);
+
+    uint8_t buffer[AERON_MAX_PATH + sizeof(aeron_driver_agent_map_raw_log_op_header_t)];
+    aeron_driver_agent_map_raw_log_op_header_t *hdr = (aeron_driver_agent_map_raw_log_op_header_t *)buffer;
+    size_t path_len = strlen(path);
+
+    hdr->time_ms = aeron_agent_epochclock();
+    hdr->map_raw_log.path_len = (int32_t)path_len;
+    hdr->map_raw_log.result = result;
+    hdr->map_raw_log.addr = (uintptr_t)mapped_raw_log;
+    memcpy(&hdr->map_raw_log.log, mapped_raw_log, sizeof(hdr->map_raw_log.log));
+    memcpy(buffer + sizeof(aeron_driver_agent_map_raw_log_op_header_t), path, path_len);
+
+    aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_MAP_RAW_LOG_OP, buffer, sizeof(aeron_driver_agent_map_raw_log_op_header_t) + path_len);
+
+    return result;
+}
+
+int aeron_driver_agent_map_raw_log_close_interceptor(aeron_mapped_raw_log_t *mapped_raw_log)
+{
+    uint8_t buffer[AERON_MAX_PATH + sizeof(aeron_driver_agent_map_raw_log_op_header_t)];
+    aeron_driver_agent_map_raw_log_op_header_t *hdr = (aeron_driver_agent_map_raw_log_op_header_t *)buffer;
+
+    hdr->time_ms = aeron_agent_epochclock();
+    hdr->map_raw_log_close.addr = (uintptr_t)mapped_raw_log;
+    memcpy(&hdr->map_raw_log_close.log, mapped_raw_log, sizeof(hdr->map_raw_log.log));
+    hdr->map_raw_log_close.result = aeron_map_raw_log_close(mapped_raw_log);
+
+    aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_MAP_RAW_LOG_OP_CLOSE, buffer, sizeof(aeron_driver_agent_map_raw_log_op_header_t));
+    return hdr->map_raw_log_close.result;
 }
 
 static void *aeron_lib = NULL;
@@ -166,6 +246,12 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         (*context)->to_client_interceptor_func = aeron_driver_agent_conductor_to_client_interceptor;
     }
 
+    if (mask & AERON_MAP_RAW_LOG_OP)
+    {
+        (*context)->map_raw_log_func = aeron_driver_agent_map_raw_log_interceptor;
+        (*context)->map_raw_log_close_func = aeron_driver_agent_map_raw_log_close_interceptor;
+    }
+
     return result;
 }
 
@@ -183,7 +269,7 @@ void aeron_driver_agent_log_frame(
 
     if (msghdr->msg_iovlen > 1)
     {
-        fprintf(stderr, "only aware of 1 iov. %d iovs detected.\n", msghdr->msg_iovlen);
+        fprintf(stderr, "only aware of 1 iov. %d iovs detected.\n", (int)msghdr->msg_iovlen);
     }
 
     uint8_t *ptr = buffer + sizeof(aeron_driver_agent_frame_log_header_t);
@@ -247,9 +333,15 @@ ssize_t recvmsg(int socket, struct msghdr *message, int flags)
 
     ssize_t result = _original_func(socket, message, flags);
 
-    if (mask & AERON_FRAME_IN)
+    if (result > 0)
     {
-        if (result > 0)
+        if (receive_data_loss_rate > 0.0 && aeron_agent_should_drop_frame(message))
+        {
+            aeron_driver_agent_log_frame(
+                AERON_FRAME_IN_DROPPED, socket, message, flags, (int) result, (int32_t) result);
+            result = 0;
+        }
+        else if (mask & AERON_FRAME_IN)
         {
             aeron_driver_agent_log_frame(AERON_FRAME_IN, socket, message, flags, (int) result, (int32_t) result);
         }
@@ -258,11 +350,10 @@ ssize_t recvmsg(int socket, struct msghdr *message, int flags)
     return result;
 }
 
-#if defined(HAVE_RECVMMSG)
+#if defined(HAVE_SENDMMSG)
+
 typedef int (*aeron_driver_agent_sendmmsg_func_t)
     (int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags);
-typedef int (*aeron_driver_agent_recvmmsg_func_t)
-    (int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, struct timespec *timeout);
 
 int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
 {
@@ -294,8 +385,21 @@ int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
 
     return result;
 }
+#endif
 
-int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, struct timespec *timeout)
+#if defined(HAVE_RECVMMSG)
+
+/* See: https://sourceware.org/bugzilla/show_bug.cgi?id=16852 */
+#if __GLIBC__ <= 5 && __GLIBC_MINOR__ < 21
+typedef const struct timespec * recvmmsg_timespec_ptr_t;
+#else
+typedef struct timespec * recvmmsg_timespec_ptr_t;
+#endif
+
+typedef int (*aeron_driver_agent_recvmmsg_func_t)
+    (int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, recvmmsg_timespec_ptr_t timeout);
+
+int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, recvmmsg_timespec_ptr_t timeout)
 {
     static aeron_driver_agent_recvmmsg_func_t _original_func = NULL;
 
@@ -314,9 +418,16 @@ int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, s
 
     int result = _original_func(sockfd, msgvec, vlen, flags, timeout);
 
-    if (mask & AERON_FRAME_IN)
+    for (int i = 0; i < result; i++)
     {
-        for (int i = 0; i < result; i++)
+        if (receive_data_loss_rate > 0.0 && aeron_agent_should_drop_frame(&msgvec[i].msg_hdr))
+        {
+            aeron_driver_agent_log_frame(
+                AERON_FRAME_IN_DROPPED, sockfd, &msgvec[i].msg_hdr, flags, msgvec[i].msg_len, msgvec[i].msg_len);
+            result = i;
+            break;
+        }
+        else if (mask & AERON_FRAME_IN)
         {
             aeron_driver_agent_log_frame(
                 AERON_FRAME_IN, sockfd, &msgvec[i].msg_hdr, flags, msgvec[i].msg_len, msgvec[i].msg_len);
@@ -326,201 +437,6 @@ int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags, s
     return result;
 }
 #endif
-
-typedef int (*aeron_driver_agent_open_func_t)(const char *pathname, int flags, mode_t mode);
-
-int open(const char *pathname, int flags, ...)
-{
-    static aeron_driver_agent_open_func_t _original_func = NULL;
-
-    if (NULL == _original_func)
-    {
-        if ((_original_func = (aeron_driver_agent_open_func_t)dlsym(RTLD_NEXT, "open")) == NULL)
-        {
-            fprintf(stderr, "%s\n", dlerror());
-            exit(EXIT_FAILURE);
-        }
-
-        printf("hooked open\n");
-    }
-
-    (void) pthread_once(&agent_is_initialized, initialize_agent_logging);
-
-    va_list argp;
-    va_start(argp, flags);
-    mode_t mode = va_arg(argp, int);
-    va_end(argp);
-
-    int result = _original_func(pathname, flags, mode);
-
-    if (mask & AERON_FD_OP)
-    {
-        uint8_t buffer[AERON_MAX_PATH + sizeof(aeron_driver_agent_fd_op_header_t)];
-        aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)buffer;
-        size_t path_len = strlen(pathname);
-
-        hdr->time_ms = aeron_agent_epochclock();
-        hdr->fd_op_open.fd = result;
-        hdr->fd_op_open.flags = flags;
-        hdr->fd_op_open.path_len = (int32_t)path_len;
-        hdr->fd_op_open.mode = mode;
-        memcpy(buffer + sizeof(aeron_driver_agent_fd_op_header_t), pathname, path_len);
-
-        aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_FD_OP_OPEN, buffer, sizeof(aeron_driver_agent_fd_op_header_t) + path_len);
-    }
-
-    return result;
-}
-
-typedef void *(*aeron_driver_agent_mmap_func_t)(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
-
-void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
-{
-    static aeron_driver_agent_mmap_func_t _original_func = NULL;
-
-    if (NULL == _original_func)
-    {
-        if ((_original_func = (aeron_driver_agent_mmap_func_t)dlsym(RTLD_NEXT, "mmap")) == NULL)
-        {
-            fprintf(stderr, "%s\n", dlerror());
-            exit(EXIT_FAILURE);
-        }
-
-        printf("hooked mmap\n");
-    }
-
-    (void) pthread_once(&agent_is_initialized, initialize_agent_logging);
-
-    void *result = _original_func(addr, len, prot, flags, fd, offset);
-
-    if (mask & AERON_FD_OP)
-    {
-        uint8_t buffer[sizeof(aeron_driver_agent_fd_op_header_t)];
-        aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)buffer;
-
-        hdr->time_ms = aeron_agent_epochclock();
-        hdr->fd_op_mmap.fd = fd;
-        hdr->fd_op_mmap.result = (uintptr_t)result;
-        hdr->fd_op_mmap.addr = (uintptr_t)addr;
-        hdr->fd_op_mmap.len = len;
-        hdr->fd_op_mmap.offset = offset;
-
-        aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_FD_OP_MMAP, buffer, sizeof(aeron_driver_agent_fd_op_header_t));
-    }
-
-    return result;
-}
-
-typedef int (*aeron_driver_agent_munmap_func_t)(void *addr, size_t len);
-
-int munmap(void *addr, size_t len)
-{
-    static aeron_driver_agent_munmap_func_t _original_func = NULL;
-
-    if (NULL == _original_func)
-    {
-        if ((_original_func = (aeron_driver_agent_munmap_func_t)dlsym(RTLD_NEXT, "munmap")) == NULL)
-        {
-            fprintf(stderr, "%s\n", dlerror());
-            exit(EXIT_FAILURE);
-        }
-
-        printf("hooked munmap\n");
-    }
-
-    (void) pthread_once(&agent_is_initialized, initialize_agent_logging);
-
-    int result = _original_func(addr, len);
-
-    if (mask & AERON_FD_OP)
-    {
-        uint8_t buffer[sizeof(aeron_driver_agent_fd_op_header_t)];
-        aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)buffer;
-
-        hdr->time_ms = aeron_agent_epochclock();
-        hdr->fd_op_munmap.addr = (uintptr_t)addr;
-        hdr->fd_op_munmap.result = result;
-        hdr->fd_op_munmap.len = len;
-
-        aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_FD_OP_MUNMAP, buffer, sizeof(aeron_driver_agent_fd_op_header_t));
-    }
-
-    return result;
-}
-
-typedef int (*aeron_driver_agent_close_func_t)(int fd);
-
-int close(int fd)
-{
-    static aeron_driver_agent_close_func_t _original_func = NULL;
-
-    if (NULL == _original_func)
-    {
-        if ((_original_func = (aeron_driver_agent_close_func_t)dlsym(RTLD_NEXT, "close")) == NULL)
-        {
-            fprintf(stderr, "%s\n", dlerror());
-            exit(EXIT_FAILURE);
-        }
-
-        printf("hooked close\n");
-    }
-
-    (void) pthread_once(&agent_is_initialized, initialize_agent_logging);
-
-    int result = _original_func(fd);
-
-    if (mask & AERON_FD_OP)
-    {
-        uint8_t buffer[sizeof(aeron_driver_agent_fd_op_header_t)];
-        aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)buffer;
-
-        hdr->time_ms = aeron_agent_epochclock();
-        hdr->fd_op_close.fd = fd;
-        hdr->fd_op_close.result = result;
-
-        aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_FD_OP_CLOSE, buffer, sizeof(aeron_driver_agent_fd_op_header_t));
-    }
-
-    return result;
-}
-
-typedef int (*aeron_driver_agent_socket_func_t)(int domain, int type, int protocol);
-
-int socket(int domain, int type, int protocol)
-{
-    static aeron_driver_agent_socket_func_t _original_func = NULL;
-
-    if (NULL == _original_func)
-    {
-        if ((_original_func = (aeron_driver_agent_socket_func_t)dlsym(RTLD_NEXT, "socket")) == NULL)
-        {
-            fprintf(stderr, "%s\n", dlerror());
-            exit(EXIT_FAILURE);
-        }
-
-        printf("hooked socket\n");
-    }
-
-    (void) pthread_once(&agent_is_initialized, initialize_agent_logging);
-
-    int result = _original_func(domain, type, protocol);
-
-    if (mask & AERON_FD_OP)
-    {
-        uint8_t buffer[sizeof(aeron_driver_agent_fd_op_header_t)];
-        aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)buffer;
-
-        hdr->time_ms = aeron_agent_epochclock();
-        hdr->fd_op_socket.fd = result;
-        hdr->fd_op_socket.domain = domain;
-        hdr->fd_op_socket.type = type;
-        hdr->fd_op_socket.protocol = protocol;
-
-        aeron_mpsc_rb_write(&logging_mpsc_rb, AERON_FD_OP_SOCKET, buffer, sizeof(aeron_driver_agent_fd_op_header_t));
-    }
-
-    return result;
-}
 
 static const char *dissect_msg_type_id(int32_t id)
 {
@@ -532,6 +448,8 @@ static const char *dissect_msg_type_id(int32_t id)
             return "CMD_OUT";
         case AERON_FRAME_IN:
             return "FRAME_IN";
+        case AERON_FRAME_IN_DROPPED:
+            return "FRAME_IN_DROPPED";
         case AERON_FRAME_OUT:
             return "FRAME_OUT";
         default:
@@ -545,6 +463,36 @@ static const char *dissect_timestamp(int64_t time_ms)
 
     snprintf(buffer, sizeof(buffer) - 1, "%" PRId64 ".%" PRId64, time_ms / 1000, time_ms % 1000);
     return buffer;
+}
+
+static const char *dissect_command_type_id(int64_t cmd_type_id)
+{
+    switch (cmd_type_id)
+    {
+        case AERON_COMMAND_ADD_PUBLICATION:
+            return "ADD_PUBLICATION";
+
+        case AERON_COMMAND_ADD_EXCLUSIVE_PUBLICATION:
+            return "ADD_EXCLUSIVE_PUBLICATION";
+
+        case AERON_COMMAND_REMOVE_PUBLICATION:
+            return "REMOVE_PUBLICATION";
+
+        case AERON_COMMAND_REMOVE_SUBSCRIPTION:
+            return "REMOVE_SUBSCRIPTION";
+
+        case AERON_COMMAND_REMOVE_COUNTER:
+            return "REMOVE_COUNTER";
+
+        case AERON_COMMAND_ADD_DESTINATION:
+            return "ADD_DESTINATION";
+
+        case AERON_COMMAND_REMOVE_DESTINATION:
+            return "REMOVE_DESTINATION";
+
+        default:
+            return "unknown command";
+    }
 }
 
 static const char *dissect_cmd_in(int64_t cmd_id, const void *message, size_t length)
@@ -561,7 +509,7 @@ static const char *dissect_cmd_in(int64_t cmd_id, const void *message, size_t le
 
             const char *channel = (const char *)message + sizeof(aeron_publication_command_t);
             snprintf(buffer, sizeof(buffer) - 1, "%s %d %*s [%" PRId64 ":%" PRId64 "]",
-                (cmd_id == AERON_COMMAND_ADD_PUBLICATION) ? "ADD_PUBLICATION" : "ADD_EXCLUSIVE_PUBLCIATION",
+                dissect_command_type_id(cmd_id),
                 command->stream_id,
                 command->channel_length,
                 channel,
@@ -572,11 +520,12 @@ static const char *dissect_cmd_in(int64_t cmd_id, const void *message, size_t le
 
         case AERON_COMMAND_REMOVE_PUBLICATION:
         case AERON_COMMAND_REMOVE_SUBSCRIPTION:
+        case AERON_COMMAND_REMOVE_COUNTER:
         {
             aeron_remove_command_t *command = (aeron_remove_command_t *)message;
 
             snprintf(buffer, sizeof(buffer) - 1, "%s %" PRId64 " [%" PRId64 ":%" PRId64 "]",
-                (cmd_id == AERON_COMMAND_REMOVE_PUBLICATION) ? "REMOVE_PUBLICATION" : "REMOVE_SUBSCRIPTION",
+                dissect_command_type_id(cmd_id),
                 command->registration_id,
                 command->correlated.client_id,
                 command->correlated.correlation_id);
@@ -609,6 +558,54 @@ static const char *dissect_cmd_in(int64_t cmd_id, const void *message, size_t le
             break;
         }
 
+        case AERON_COMMAND_ADD_DESTINATION:
+        case AERON_COMMAND_REMOVE_DESTINATION:
+        {
+            aeron_destination_command_t *command = (aeron_destination_command_t *)message;
+
+            const char *channel = (const char *)message + sizeof(aeron_destination_command_t);
+            snprintf(buffer, sizeof(buffer) - 1, "%s %*s %" PRId64 " [%" PRId64 ":%" PRId64 "]",
+                dissect_command_type_id(cmd_id),
+                command->channel_length,
+                channel,
+                command->registration_id,
+                command->correlated.client_id,
+                command->correlated.correlation_id);
+            break;
+        }
+
+        case AERON_COMMAND_ADD_COUNTER:
+        {
+            aeron_counter_command_t *command = (aeron_counter_command_t *)message;
+
+            const uint8_t *cursor = (const uint8_t *)message + sizeof(aeron_counter_command_t);
+            int32_t key_length = *((int32_t *)cursor);
+            const uint8_t *key = cursor + sizeof(int32_t);
+
+            cursor = key + key_length;
+            int32_t label_length = *((int32_t *)cursor);
+
+            snprintf(buffer, sizeof(buffer) - 1, "ADD_COUNTER %d [%d %d][%d %d][%" PRId64 ":%" PRId64 "]",
+                command->type_id,
+                (int)(sizeof(aeron_counter_command_t) + sizeof(int32_t)),
+                key_length,
+                (int)(sizeof(aeron_counter_command_t) + (2 * sizeof(int32_t)) + key_length),
+                label_length,
+                command->correlated.client_id,
+                command->correlated.correlation_id);
+            break;
+        }
+
+        case AERON_COMMAND_CLIENT_CLOSE:
+        {
+            aeron_correlated_command_t *command = (aeron_correlated_command_t *)message;
+
+            snprintf(buffer, sizeof(buffer) - 1, "CLIENT_CLOSE [%" PRId64 ":%" PRId64 "]",
+                command->client_id,
+                command->correlation_id);
+            break;
+        }
+
         default:
             break;
     }
@@ -625,11 +622,9 @@ static const char *dissect_cmd_out(int64_t cmd_id, const void *message, size_t l
     {
         case AERON_RESPONSE_ON_OPERATION_SUCCESS:
         {
-            aeron_correlated_command_t *command = (aeron_correlated_command_t *)message;
+            aeron_operation_succeeded_t *command = (aeron_operation_succeeded_t *)message;
 
-            snprintf(buffer, sizeof(buffer) - 1, "ON_OPERATION_SUCCESS [%" PRId64 ":%" PRId64 "]",
-                command->client_id,
-                command->correlation_id);
+            snprintf(buffer, sizeof(buffer) - 1, "ON_OPERATION_SUCCEEDED %" PRId64, command->correlation_id);
             break;
         }
 
@@ -639,15 +634,26 @@ static const char *dissect_cmd_out(int64_t cmd_id, const void *message, size_t l
             aeron_publication_buffers_ready_t *command = (aeron_publication_buffers_ready_t *)message;
 
             const char *log_file_name = (const char *)message + sizeof(aeron_publication_buffers_ready_t);
-            snprintf(buffer, sizeof(buffer) - 1, "%s %d:%d %d [%" PRId64 " %" PRId64 "]\n    \"%*s\"",
+            snprintf(buffer, sizeof(buffer) - 1, "%s %d:%d %d %d [%" PRId64 " %" PRId64 "]\n    \"%*s\"",
                 (cmd_id == AERON_RESPONSE_ON_PUBLICATION_READY) ? "ON_PUBLICATION_READY" : "ON_EXCLUSIVE_PUBLICATION_READY",
                 command->session_id,
                 command->stream_id,
                 command->position_limit_counter_id,
+                command->channel_status_indicator_id,
                 command->correlation_id,
                 command->registration_id,
                 command->log_file_length,
                 log_file_name);
+            break;
+        }
+
+        case AERON_RESPONSE_ON_SUBSCRIPTION_READY:
+        {
+            aeron_subscription_ready_t *command = (aeron_subscription_ready_t *)message;
+
+            snprintf(buffer, sizeof(buffer) - 1, "ON_SUBSCRIPTION_READY %" PRId64 " %d",
+                command->correlation_id,
+                command->channel_status_indicator_id);
             break;
         }
 
@@ -701,6 +707,16 @@ static const char *dissect_cmd_out(int64_t cmd_id, const void *message, size_t l
                 *source_identity_length, source_identity, command->correlation_id);
 
             len += snprintf(ptr + len, sizeof(buffer) - 1 - len, "    \"%*s\"", *log_file_name_length, log_file_name);
+            break;
+        }
+
+        case AERON_RESPONSE_ON_COUNTER_READY:
+        {
+            aeron_counter_update_t *command = (aeron_counter_update_t *)message;
+
+            snprintf(buffer, sizeof(buffer) -1 , "ON_COUNTER_READY %" PRId64 " %d",
+                command->correlation_id,
+                command->counter_id);
             break;
         }
 
@@ -870,6 +886,7 @@ void aeron_driver_agent_log_dissector(int32_t msg_type_id, const void *message, 
         }
 
         case AERON_FRAME_IN:
+        case AERON_FRAME_IN_DROPPED:
         case AERON_FRAME_OUT:
         {
             aeron_driver_agent_frame_log_header_t *hdr = (aeron_driver_agent_frame_log_header_t *)message;
@@ -883,78 +900,36 @@ void aeron_driver_agent_log_dissector(int32_t msg_type_id, const void *message, 
                 dissect_timestamp(hdr->time_ms),
                 hdr->result,
                 (int)hdr->message_len,
-                (msg_type_id == AERON_FRAME_IN) ? "FRAME_IN from" : "FRAME_OUT to",
+                dissect_msg_type_id(msg_type_id),
                 dissect_sockaddr(addr, (size_t)hdr->sockaddr_len),
                 dissect_frame(frame, (size_t)hdr->message_len));
             break;
         }
 
-        case AERON_FD_OP_OPEN:
+        case AERON_MAP_RAW_LOG_OP:
         {
-            aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)message;
-            const char *pathname = (const char *)message + sizeof(aeron_driver_agent_fd_op_header_t);
+            aeron_driver_agent_map_raw_log_op_header_t *hdr = (aeron_driver_agent_map_raw_log_op_header_t *)message;
+            const char *pathname = (const char *)message + sizeof(aeron_driver_agent_map_raw_log_op_header_t);
 
             printf(
-                "[%s] OPEN %d = \"%*s\"\n",
+                "[%s] MAP_RAW_LOG %p, \"%*s\" = %d\n",
                 dissect_timestamp(hdr->time_ms),
-                hdr->fd_op_open.fd,
-                hdr->fd_op_open.path_len,
-                pathname);
+                (void *)hdr->map_raw_log.addr,
+                hdr->map_raw_log.path_len,
+                pathname,
+                hdr->map_raw_log.result);
             break;
         }
 
-        case AERON_FD_OP_MMAP:
+        case AERON_MAP_RAW_LOG_OP_CLOSE:
         {
-            aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)message;
+            aeron_driver_agent_map_raw_log_op_header_t *hdr = (aeron_driver_agent_map_raw_log_op_header_t *)message;
 
             printf(
-                "[%s] MMAP %p = fd %d len %d offset %d\n",
+                "[%s] MAP_RAW_LOG_CLOSE %p = %d\n",
                 dissect_timestamp(hdr->time_ms),
-                (void *)hdr->fd_op_mmap.result,
-                hdr->fd_op_mmap.fd,
-                (int)hdr->fd_op_mmap.len,
-                (int)hdr->fd_op_mmap.offset);
-            break;
-        }
-
-        case AERON_FD_OP_MUNMAP:
-        {
-            aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)message;
-
-            printf(
-                "[%s] MUNMAP %d = addr %p len %d\n",
-                dissect_timestamp(hdr->time_ms),
-                hdr->fd_op_munmap.result,
-                (void *)hdr->fd_op_munmap.addr,
-                (int)hdr->fd_op_munmap.len);
-            break;
-        }
-
-        case AERON_FD_OP_CLOSE:
-        {
-            aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)message;
-
-            printf(
-                "[%s] CLOSE %d = fd %d\n",
-                dissect_timestamp(hdr->time_ms),
-                hdr->fd_op_close.result,
-                hdr->fd_op_close.fd);
-            break;
-        }
-
-        case AERON_FD_OP_SOCKET:
-        {
-            aeron_driver_agent_fd_op_header_t *hdr = (aeron_driver_agent_fd_op_header_t *)message;
-
-            printf(
-                "[%s] SOCKET %d = %d (%s) %d %d\n",
-                dissect_timestamp(hdr->time_ms),
-                hdr->fd_op_socket.fd,
-                hdr->fd_op_socket.domain,
-                hdr->fd_op_socket.domain == AF_INET6 ? "AF_INE6" :
-                    (hdr->fd_op_socket.domain == AF_INET ? "AF_INET" : "unknown" ),
-                hdr->fd_op_socket.type,
-                hdr->fd_op_socket.protocol);
+                (void *)hdr->map_raw_log_close.addr,
+                hdr->map_raw_log_close.result);
             break;
         }
 

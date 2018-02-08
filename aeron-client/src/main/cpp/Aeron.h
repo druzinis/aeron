@@ -27,6 +27,7 @@
 #include "ClientConductor.h"
 #include "concurrent/SleepingIdleStrategy.h"
 #include "concurrent/AgentRunner.h"
+#include "concurrent/AgentInvoker.h"
 #include "Publication.h"
 #include "Subscription.h"
 #include "Context.h"
@@ -84,7 +85,7 @@ public:
      * This function returns immediately and does not wait for the response from the media driver. The returned
      * registration id is to be used to determine the status of the command with the media driver.
      *
-     * @param channel for receiving the messages known to the media layer.
+     * @param channel for sending the messages known to the media layer.
      * @param streamId within the channel scope.
      * @return registration id for the publication
      */
@@ -118,7 +119,7 @@ public:
     /**
      * Add an {@link ExclusivePublication} for publishing messages to subscribers from a single thread.
      *
-     * @param channel  for receiving the messages known to the media layer.
+     * @param channel  for sending the messages known to the media layer.
      * @param streamId within the channel scope.
      * @return registration id for the publication
      */
@@ -217,9 +218,69 @@ public:
      *
      * @return next correlation id that is unique for the Media Driver.
      */
-    inline int64_t nextCorrelationId()
+    inline std::int64_t nextCorrelationId()
     {
         return m_toDriverRingBuffer.nextCorrelationId();
+    }
+
+    /**
+     * Allocate a counter on the media driver and return a {@link Counter} for it.
+     *
+     * @param typeId      for the counter.
+     * @param keyBuffer   containing the optional key for the counter.
+     * @param keyLength   of the key in the keyBuffer.
+     * @param label       for the counter.
+     * @return registration id for the Counter
+     */
+    inline std::int64_t addCounter(
+        std::int32_t typeId,
+        const std::uint8_t *keyBuffer,
+        std::size_t keyLength,
+        const std::string& label)
+    {
+        return m_conductor.addCounter(typeId, keyBuffer, keyLength, label);
+    }
+
+    /**
+     * Retrieve the Counter associated with the given registrationId.
+     *
+     * This method is non-blocking.
+     *
+     * The value returned is dependent on what has occurred with respect to the media driver:
+     *
+     * - If the registrationId is unknown, then a nullptr is returned.
+     * - If the media driver has not answered the add command, then a nullptr is returned.
+     * - If the media driver has successfully added the Counter then what is returned is the Counter.
+     * - If the media driver has returned an error, this method will throw the error returned.
+     *
+     * @see Aeron::addCounter
+     *
+     * @param registrationId of the Counter returned by Aeron::addCounter
+     * @return Counter associated with the registrationId
+     */
+    inline std::shared_ptr<Counter> findCounter(std::int64_t registrationId)
+    {
+        return m_conductor.findCounter(registrationId);
+    }
+
+    /**
+     * Return the AgentInvoker for the client conductor.
+     *
+     * @return AgenInvoker for the conductor.
+     */
+    inline AgentInvoker<ClientConductor>& conductorAgentInvoker()
+    {
+        return m_conductorInvoker;
+    }
+
+    /**
+     * Get the CountersReader for the Aeron media driver counters.
+     *
+     * @return CountersReader for the Aeron media driver in use.
+     */
+    inline CountersReader& countersReader()
+    {
+        return m_conductor.countersReader();
     }
 
 private:
@@ -233,6 +294,7 @@ private:
 
     AtomicBuffer m_toDriverAtomicBuffer;
     AtomicBuffer m_toClientsAtomicBuffer;
+    AtomicBuffer m_countersMetadataBuffer;
     AtomicBuffer m_countersValueBuffer;
 
     ManyToOneRingBuffer m_toDriverRingBuffer;
@@ -244,6 +306,7 @@ private:
     ClientConductor m_conductor;
     SleepingIdleStrategy m_idleStrategy;
     AgentRunner<ClientConductor, SleepingIdleStrategy> m_conductorRunner;
+    AgentInvoker<ClientConductor> m_conductorInvoker;
 
     MemoryMappedFile::ptr_t mapCncFile(Context& context);
 };

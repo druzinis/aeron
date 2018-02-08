@@ -19,6 +19,7 @@
 
 #include <util/Index.h>
 #include <concurrent/AtomicBuffer.h>
+#include <concurrent/logbuffer/BufferClaim.h>
 #include <concurrent/logbuffer/DataFrameHeader.h>
 
 namespace aeron { namespace concurrent { namespace logbuffer {
@@ -29,7 +30,7 @@ namespace aeron { namespace concurrent { namespace logbuffer {
  * The claimed space is in {@link #buffer()} between {@link #offset()} and {@link #offset()} + {@link #length()}.
  * When the buffer is filled with message data, use {@link #commit()} to make it available to subscribers.
  */
-class ExclusiveBufferClaim
+class ExclusiveBufferClaim : public BufferClaim
 {
 public:
     typedef ExclusiveBufferClaim this_t;
@@ -38,92 +39,51 @@ public:
     {
     }
 
-    /// @cond HIDDEN_SYMBOLS
-    inline void wrap(std::uint8_t *buffer, util::index_t length)
-    {
-        m_buffer.wrap(buffer, length);
-    }
-    /// @endcond
-
-    /// @cond HIDDEN_SYMBOLS
-    inline void wrap(AtomicBuffer& buffer, util::index_t offset, util::index_t length)
-    {
-        m_buffer.wrap(buffer.buffer() + offset, length);
-    }
-    /// @endcond
-
-
     /**
-     * The referenced buffer to be used.
+     * Get the value of the flags field.
      *
-     * @return the referenced buffer to be used..
+     * @return the value of the header flags field.
      */
-    inline AtomicBuffer& buffer()
+    inline std::uint8_t flags() const
     {
-        return m_buffer;
+        return m_buffer.getUInt8(DataFrameHeader::FLAGS_FIELD_OFFSET);
     }
 
     /**
-     * The offset in the buffer at which the claimed range begins.
+     * Set the value of the header flags field.
      *
-     * @return offset in the buffer at which the range begins.
+     * @param flags value to be set in the header.
+     * @return this for a fluent API.
      */
-    inline util::index_t offset() const
+    inline this_t& flags(const std::uint8_t flags)
     {
-        return DataFrameHeader::LENGTH;
-    }
+        m_buffer.putUInt8(DataFrameHeader::FLAGS_FIELD_OFFSET, flags);
 
-    /**
-     * The length of the claimed range in the buffer.
-     *
-     * @return length of the range in the buffer.
-     */
-    inline util::index_t length() const
-    {
-        return m_buffer.capacity() - DataFrameHeader::LENGTH;
-    }
-
-    /**
-     * Get the value stored in the reserve space at the end of a data frame header.
-     *
-     * @return the value stored in the reserve space at the end of a data frame header.
-     */
-    inline std::int64_t reservedValue() const
-    {
-        return m_buffer.getInt64(DataFrameHeader::RESERVED_VALUE_FIELD_OFFSET);
-    }
-
-    /**
-     * Write the provided value into the reserved space at the end of the data frame header.
-     *
-     * @param value to be stored in the reserve space at the end of a data frame header.
-     * @return this for fluent API semantics.
-     */
-    inline this_t& reservedValue(std::int64_t value)
-    {
-        m_buffer.putInt64(DataFrameHeader::RESERVED_VALUE_FIELD_OFFSET, value);
         return *this;
     }
 
     /**
-     * Commit the message to the log buffer so that is it available to subscribers.
+     * Get the value of the header type field.
+     *
+     * @return the value of the header type field.
      */
-    inline void commit()
+    inline std::uint16_t headerType() const
     {
-        m_buffer.putInt32Ordered(0, m_buffer.capacity());
+        return m_buffer.getUInt16(DataFrameHeader::TYPE_FIELD_OFFSET);
     }
 
     /**
-     * Abort a claim of the message space to the log buffer so that log can progress ignoring this claim.
+     * Set the value of the header type field.
+     *
+     * @param type value to be set in the header.
+     * @return this for a fluent API.
      */
-    inline void abort()
+    inline this_t& headerType(const std::uint16_t type)
     {
-        m_buffer.putUInt16(DataFrameHeader::TYPE_FIELD_OFFSET, DataFrameHeader::HDR_TYPE_PAD);
-        m_buffer.putInt32Ordered(0, m_buffer.capacity());
-    }
+        m_buffer.putUInt16(DataFrameHeader::TYPE_FIELD_OFFSET, type);
 
-private:
-    AtomicBuffer m_buffer;
+        return *this;
+    }
 };
 
 }}}

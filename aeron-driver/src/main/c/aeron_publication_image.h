@@ -28,6 +28,7 @@ typedef enum aeron_publication_image_status_enum
     AERON_PUBLICATION_IMAGE_STATUS_INACTIVE,
     AERON_PUBLICATION_IMAGE_STATUS_ACTIVE,
     AERON_PUBLICATION_IMAGE_STATUS_LINGER,
+    AERON_PUBLICATION_IMAGE_STATUS_DONE
 }
 aeron_publication_image_status_t;
 
@@ -36,11 +37,11 @@ typedef struct aeron_publication_image_stct
     struct aeron_publication_image_conductor_fields_stct
     {
         aeron_driver_managed_resource_t managed_resource;
-        aeron_subscribeable_t subscribeable;
+        aeron_subscribable_t subscribable;
         int64_t clean_position;
         int64_t time_of_last_status_change_ns;
         int64_t liveness_timeout_ns;
-        bool has_reached_end_of_life;
+        bool is_reliable;
         aeron_publication_image_status_t status;
     }
     conductor_fields;
@@ -95,11 +96,14 @@ typedef struct aeron_publication_image_stct
     int32_t loss_term_offset;
     size_t loss_length;
 
+    bool is_end_of_stream;
+
     int64_t *heartbeats_received_counter;
     int64_t *flow_control_under_runs_counter;
     int64_t *flow_control_over_runs_counter;
     int64_t *status_messages_sent_counter;
     int64_t *nak_messages_sent_counter;
+    int64_t *loss_gap_fills_counter;
 }
 aeron_publication_image_t;
 
@@ -139,9 +143,11 @@ int aeron_publication_image_insert_packet(
 int aeron_publication_image_on_rttm(
     aeron_publication_image_t *image, aeron_rttm_header_t *header, struct sockaddr_storage *addr);
 
-int aeron_publicaion_image_send_pending_status_message(aeron_publication_image_t *image);
+int aeron_publication_image_send_pending_status_message(aeron_publication_image_t *image);
 
-int aeron_publicaion_image_send_pending_loss(aeron_publication_image_t *image);
+int aeron_publication_image_send_pending_loss(aeron_publication_image_t *image);
+
+int aeron_publication_image_initiate_rttm(aeron_publication_image_t *image, int64_t now_ns);
 
 void aeron_publication_image_on_time_event(
     aeron_driver_conductor_t *conductor, aeron_publication_image_t *image, int64_t now_ns, int64_t now_ms);
@@ -153,8 +159,7 @@ inline bool aeron_publication_image_is_heartbeat(const uint8_t *buffer, size_t l
 
 inline bool aeron_publication_image_is_end_of_stream(const uint8_t *buffer, size_t length)
 {
-    return ((aeron_frame_header_t *)buffer)->flags &
-        (AERON_DATA_HEADER_EOS_FLAG | AERON_DATA_HEADER_BEGIN_FLAG | AERON_DATA_HEADER_END_FLAG);
+    return (((aeron_frame_header_t *)buffer)->flags & AERON_DATA_HEADER_EOS_FLAG) != 0;
 }
 
 inline bool aeron_publication_image_is_flow_control_under_run(
@@ -183,12 +188,6 @@ inline bool aeron_publication_image_is_flow_control_over_run(
     return is_flow_control_over_run;
 }
 
-inline void aeron_publication_image_hwm_candidate(aeron_publication_image_t *image, int64_t proposed_position)
-{
-    AERON_PUT_ORDERED(image->last_packet_timestamp_ns, image->nano_clock());
-    aeron_counter_propose_max_ordered(image->rcv_hwm_position.value_addr, proposed_position);
-}
-
 inline void aeron_publication_image_schedule_status_message(
     aeron_publication_image_t *image, int64_t now_ns, int64_t sm_position, int32_t window_length)
 {
@@ -207,9 +206,9 @@ inline bool aeron_publication_image_is_drained(aeron_publication_image_t *image)
 {
     int64_t rebuild_position = aeron_counter_get(image->rcv_pos_position.value_addr);
 
-    for (size_t i = 0, length = image->conductor_fields.subscribeable.length; i < length; i++)
+    for (size_t i = 0, length = image->conductor_fields.subscribable.length; i < length; i++)
     {
-        int64_t position = aeron_counter_get_volatile(image->conductor_fields.subscribeable.array[i].value_addr);
+        int64_t position = aeron_counter_get_volatile(image->conductor_fields.subscribable.array[i].value_addr);
 
         if (position < rebuild_position)
         {
@@ -222,8 +221,13 @@ inline bool aeron_publication_image_is_drained(aeron_publication_image_t *image)
 
 inline bool aeron_publication_image_is_accepting_subscriptions(aeron_publication_image_t *image)
 {
-    return (image->conductor_fields.subscribeable.length > 0 &&
+    return (image->conductor_fields.subscribable.length > 0 &&
         image->conductor_fields.status == AERON_PUBLICATION_IMAGE_STATUS_ACTIVE);
+}
+
+inline void aeron_publication_image_disconnect_endpoint(aeron_publication_image_t *image)
+{
+    image->endpoint = NULL;
 }
 
 inline const char *aeron_publication_image_log_file_name(aeron_publication_image_t *image)
@@ -238,7 +242,7 @@ inline int64_t aeron_publication_image_registration_id(aeron_publication_image_t
 
 inline size_t aeron_publication_image_num_subscriptions(aeron_publication_image_t *image)
 {
-    return image->conductor_fields.subscribeable.length;
+    return image->conductor_fields.subscribable.length;
 }
 
 #endif //AERON_AERON_PUBLICATION_IMAGE_H

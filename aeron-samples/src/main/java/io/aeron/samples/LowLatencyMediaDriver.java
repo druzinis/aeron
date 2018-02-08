@@ -20,14 +20,16 @@ import io.aeron.driver.ThreadingMode;
 import org.agrona.concurrent.BusySpinIdleStrategy;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
+import static org.agrona.SystemUtil.loadPropertiesFiles;
+
 /**
  * Sample setup for a {@link MediaDriver} that is configured for low latency communications.
  */
 public class LowLatencyMediaDriver
 {
-    public static void main(final String[] args) throws Exception
+    public static void main(final String[] args)
     {
-        MediaDriver.loadPropertiesFiles(args);
+        loadPropertiesFiles(args);
 
         final MediaDriver.Context ctx = new MediaDriver.Context()
             .termBufferSparseFile(false)

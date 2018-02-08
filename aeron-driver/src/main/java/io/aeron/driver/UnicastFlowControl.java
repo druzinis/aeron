@@ -18,6 +18,7 @@ package io.aeron.driver;
 import io.aeron.protocol.StatusMessageFlyweight;
 
 import java.net.InetSocketAddress;
+import java.util.concurrent.TimeUnit;
 
 import static io.aeron.logbuffer.LogBufferDescriptor.computePosition;
 
@@ -30,6 +31,16 @@ import static io.aeron.logbuffer.LogBufferDescriptor.computePosition;
 public class UnicastFlowControl implements FlowControl
 {
     /**
+     * Timeout, in nanoseconds, until a receiver is no longer tracked and considered for linger purposes.
+     */
+    private static final long RECEIVER_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(2);
+
+    private long lastPosition = 0;
+    private long timeOfLastStatusMessage = 0;
+
+    private volatile boolean shouldLinger = true;
+
+    /**
      * {@inheritDoc}
      */
     public long onStatusMessage(
@@ -38,7 +49,7 @@ public class UnicastFlowControl implements FlowControl
         final long senderLimit,
         final int initialTermId,
         final int positionBitsToShift,
-        final long nowNs)
+        final long timeNs)
     {
         final long position = computePosition(
             flyweight.consumptionTermId(),
@@ -46,21 +57,41 @@ public class UnicastFlowControl implements FlowControl
             positionBitsToShift,
             initialTermId);
 
+        lastPosition = Math.max(lastPosition, position);
+        timeOfLastStatusMessage = timeNs;
+
         return Math.max(senderLimit, position + flyweight.receiverWindowLength());
     }
 
     /**
      * {@inheritDoc}
      */
-    public void initialize(final int initialTermId, final int termBufferCapacity)
+    public void initialize(final int initialTermId, final int termBufferLength)
     {
     }
 
     /**
      * {@inheritDoc}
      */
-    public long onIdle(final long nowNs, final long senderLimit)
+    public long onIdle(
+        final long timeNs, final long senderLimit, final long senderPosition, final boolean isEndOfStream)
     {
+        if (isEndOfStream && shouldLinger)
+        {
+            if (lastPosition >= senderPosition || timeNs > (timeOfLastStatusMessage + RECEIVER_TIMEOUT_NS))
+            {
+                shouldLinger = false;
+            }
+        }
+
         return senderLimit;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public boolean shouldLinger(final long timeNs)
+    {
+        return shouldLinger;
     }
 }

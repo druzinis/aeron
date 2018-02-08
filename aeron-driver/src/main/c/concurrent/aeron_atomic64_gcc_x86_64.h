@@ -24,14 +24,22 @@ do \
 { \
     dst = src; \
     __asm__ volatile("" ::: "memory"); \
-} while(0)
+} while(false)
 
 #define AERON_PUT_ORDERED(dst,src) \
 do \
 { \
     __asm__ volatile("" ::: "memory"); \
     dst = src; \
-} while(0)
+} while(false)
+
+#define AERON_PUT_VOLATILE(dst,src) \
+do \
+{ \
+    __asm__ volatile("" ::: "memory"); \
+    dst = src; \
+    __asm__ volatile("" ::: "memory"); \
+} while(false)
 
 #define AERON_GET_AND_ADD_INT64(original,dst,value) \
 do \
@@ -40,7 +48,7 @@ do \
         "lock; xaddq %0, %1" \
         : "=r"(original), "+m"(dst) \
         : "0"(value)); \
-} while(0)
+} while(false)
 
 #define AERON_GET_AND_ADD_INT32(original,dst,value) \
 do \
@@ -49,7 +57,7 @@ do \
         "lock; xaddl %0, %1" \
         : "=r"(original), "+m"(dst) \
         : "0"(value)); \
-} while(0)
+} while(false)
 
 #define AERON_CMPXCHG64(original,dst,expected,desired) \
 do \
@@ -80,11 +88,31 @@ inline bool aeron_cmpxchgu64(volatile uint64_t* destination,  uint64_t expected,
     return (original == expected);
 }
 
+inline bool aeron_cmpxchg32(volatile int32_t* destination,  int32_t expected, int32_t desired)
+{
+    int32_t original;
+    __asm__ volatile(
+    "lock; cmpxchgl %2, %1"
+    : "=a"(original), "+m"(*destination)
+    : "q"(desired), "0"(expected));
+    return (original == expected);
+}
+
+/* loadFence */
 inline void aeron_acquire()
 {
     volatile int64_t* dummy;
     __asm__ volatile("movq 0(%%rsp), %0" : "=r" (dummy) : : "memory");
 }
+
+/* storeFence */
+inline void aeron_release()
+{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+    volatile int64_t dummy = 0;
+}
+#pragma GCC diagnostic pop
 
 #define AERON_CMPXCHG32(original,dst,expected,desired) \
 do \

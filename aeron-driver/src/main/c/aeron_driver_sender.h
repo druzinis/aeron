@@ -64,6 +64,8 @@ typedef struct aeron_driver_sender_stct
     int64_t *total_bytes_sent_counter;
     int64_t *errors_counter;
     int64_t *invalid_frames_counter;
+    int64_t *status_messages_received_counter;
+    int64_t *nak_messages_received_counter;
 }
 aeron_driver_sender_t;
 
@@ -92,6 +94,8 @@ void aeron_driver_sender_on_add_endpoint(void *clientd, void *command);
 void aeron_driver_sender_on_remove_endpoint(void *clientd, void *command);
 void aeron_driver_sender_on_add_publication(void *clientd, void *command);
 void aeron_driver_sender_on_remove_publication(void *clientd, void *command);
+void aeron_driver_sender_on_add_destination(void *clientd, void *command);
+void aeron_driver_sender_on_remove_destination(void *clientd, void *command);
 
 int aeron_driver_sender_do_send(aeron_driver_sender_t *sender, int64_t now_ns);
 

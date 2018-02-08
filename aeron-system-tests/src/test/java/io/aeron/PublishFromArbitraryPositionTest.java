@@ -63,7 +63,7 @@ public class PublishFromArbitraryPositionTest
         final int initialTermId = rnd.nextInt(1234);
         final int termOffset = BitUtil.align(rnd.nextInt(termLength), FrameDescriptor.FRAME_ALIGNMENT);
         final int termId = initialTermId + rnd.nextInt(1000);
-        final String channelUri = new ChannelUriBuilder()
+        final String channelUri = new ChannelUriStringBuilder()
             .endpoint("localhost:54325")
             .termLength(termLength)
             .initialTermId(initialTermId)
@@ -72,15 +72,17 @@ public class PublishFromArbitraryPositionTest
             .mtu(mtu)
             .media("udp")
             .build();
+
         final int expectedNumberOfFragments = 10 + rnd.nextInt(10000);
 
         final MediaDriver.Context driverCtx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
             .termBufferSparseFile(true);
 
         try (MediaDriver ignore = MediaDriver.launch(driverCtx);
-             Aeron aeron = Aeron.connect();
-             ExclusivePublication publication = aeron.addExclusivePublication(channelUri, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(channelUri, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            ExclusivePublication publication = aeron.addExclusivePublication(channelUri, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(channelUri, STREAM_ID))
         {
             while (!publication.isConnected())
             {

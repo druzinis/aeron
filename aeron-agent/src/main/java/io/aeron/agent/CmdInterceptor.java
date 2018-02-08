@@ -22,6 +22,9 @@ import static io.aeron.agent.EventCode.*;
 import static io.aeron.agent.EventLogger.LOGGER;
 import static io.aeron.command.ControlProtocolEvents.*;
 
+/**
+ * Intercepts calls for the command protocol from clients to the driver for logging.
+ */
 public class CmdInterceptor
 {
     @Advice.OnMethodEnter
@@ -66,7 +69,7 @@ public class CmdInterceptor
                 break;
 
             case ON_ERROR:
-                // TODO: add event code and dissector
+                LOGGER.log(CMD_OUT_ERROR, buffer, index, length);
                 break;
 
             case ON_OPERATION_SUCCESS:
@@ -83,6 +86,30 @@ public class CmdInterceptor
 
             case ON_EXCLUSIVE_PUBLICATION_READY:
                 LOGGER.log(CMD_OUT_EXCLUSIVE_PUBLICATION_READY, buffer, index, length);
+                break;
+
+            case ON_SUBSCRIPTION_READY:
+                LOGGER.log(CMD_OUT_SUBSCRIPTION_READY, buffer, index, length);
+                break;
+
+            case ON_COUNTER_READY:
+                LOGGER.log(CMD_OUT_COUNTER_READY, buffer, index, length);
+                break;
+
+            case ON_UNAVAILABLE_COUNTER:
+                LOGGER.log(CMD_OUT_ON_UNAVAILABLE_COUNTER, buffer, index, length);
+                break;
+
+            case ADD_COUNTER:
+                LOGGER.log(CMD_IN_ADD_COUNTER, buffer, index, length);
+                break;
+
+            case REMOVE_COUNTER:
+                LOGGER.log(CMD_IN_REMOVE_COUNTER, buffer, index, length);
+                break;
+
+            case CLIENT_CLOSE:
+                LOGGER.log(CMD_IN_CLIENT_CLOSE, buffer, index, length);
                 break;
         }
     }

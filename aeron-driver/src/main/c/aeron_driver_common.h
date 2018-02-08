@@ -22,6 +22,7 @@
 #include <stdbool.h>
 
 #define AERON_MAX_PATH (256)
+#define AERON_CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED (-1)
 
 typedef void (*aeron_idle_strategy_func_t)(void *, int);
 typedef int (*aeron_idle_strategy_init_func_t)(void **);
@@ -47,13 +48,16 @@ aeron_position_t;
 
 typedef struct aeron_position_stct aeron_counter_t;
 
-typedef struct aeron_subscribeable_stct
+typedef struct aeron_subscribable_stct
 {
     aeron_position_t *array;
     size_t length;
     size_t capacity;
+    void (*add_position_hook_func)(void *clientd, int64_t *value_addr);
+    void (*remove_position_hook_func)(void *clientd, int64_t *value_addr);
+    void *clientd;
 }
-aeron_subscribeable_t;
+aeron_subscribable_t;
 
 typedef struct aeron_command_base_stct
 {
@@ -62,9 +66,13 @@ typedef struct aeron_command_base_stct
 }
 aeron_command_base_t;
 
-int aeron_driver_subscribeable_add_position(
-    aeron_subscribeable_t *subscribeable, int64_t counter_id, int64_t *value_addr);
-void aeron_driver_subscribeable_remove_position(aeron_subscribeable_t *subscribeable, int64_t counter_id);
+int aeron_driver_subscribable_add_position(
+    aeron_subscribable_t *subscribable, int64_t counter_id, int64_t *value_addr);
+void aeron_driver_subscribable_remove_position(aeron_subscribable_t *subscribable, int64_t counter_id);
+
+inline void aeron_driver_subscribable_null_hook(void *clientd, int64_t *value_addr)
+{
+}
 
 void aeron_command_on_delete_cmd(void *clientd, void *cmd);
 

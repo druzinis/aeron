@@ -15,10 +15,7 @@
  */
 package io.aeron;
 
-import io.aeron.command.ControlProtocolEvents;
-import io.aeron.command.CorrelatedMessageFlyweight;
-import io.aeron.command.ErrorResponseFlyweight;
-import io.aeron.command.PublicationBuffersReadyFlyweight;
+import io.aeron.command.*;
 import io.aeron.exceptions.ConductorServiceTimeoutException;
 import io.aeron.exceptions.DriverTimeoutException;
 import io.aeron.exceptions.RegistrationException;
@@ -26,14 +23,11 @@ import io.aeron.logbuffer.LogBufferDescriptor;
 import io.aeron.protocol.DataHeaderFlyweight;
 import org.agrona.ErrorHandler;
 import org.agrona.MutableDirectBuffer;
-import org.agrona.concurrent.EpochClock;
-import org.agrona.concurrent.NanoClock;
-import org.agrona.concurrent.UnsafeBuffer;
+import org.agrona.concurrent.*;
 import org.agrona.concurrent.broadcast.CopyBroadcastReceiver;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.nio.channels.FileChannel;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.function.ToIntFunction;
@@ -43,8 +37,6 @@ import static io.aeron.logbuffer.LogBufferDescriptor.PARTITION_COUNT;
 import static io.aeron.logbuffer.LogBufferDescriptor.TERM_MIN_LENGTH;
 import static java.lang.Boolean.TRUE;
 import static java.nio.ByteBuffer.allocateDirect;
-import static java.nio.channels.FileChannel.MapMode.READ_ONLY;
-import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.sameInstance;
@@ -74,19 +66,20 @@ public class ClientConductorTest
     private static final long KEEP_ALIVE_INTERVAL = TimeUnit.MILLISECONDS.toNanos(500);
     private static final long AWAIT_TIMEOUT = 100;
     private static final long INTER_SERVICE_TIMEOUT_MS = 1000;
-    private static final long PUBLICATION_CONNECTION_TIMEOUT_MS = 5000;
 
-    private static final int SUBSCRIBER_POSITION_ID = 2;
-    private static final int SUBSCRIBER_POSITION_REGISTRATION_ID = 4001;
+    private static final int SUBSCRIPTION_POSITION_ID = 2;
+    private static final int SUBSCRIPTION_POSITION_REGISTRATION_ID = 4001;
 
     private static final String SOURCE_INFO = "127.0.0.1:40789";
 
     private final PublicationBuffersReadyFlyweight publicationReady = new PublicationBuffersReadyFlyweight();
-    private final CorrelatedMessageFlyweight correlatedMessage = new CorrelatedMessageFlyweight();
+    private final SubscriptionReadyFlyweight subscriptionReady = new SubscriptionReadyFlyweight();
+    private final OperationSucceededFlyweight operationSuccess = new OperationSucceededFlyweight();
     private final ErrorResponseFlyweight errorResponse = new ErrorResponseFlyweight();
 
     private final UnsafeBuffer publicationReadyBuffer = new UnsafeBuffer(allocateDirect(SEND_BUFFER_CAPACITY));
-    private final UnsafeBuffer correlatedMessageBuffer = new UnsafeBuffer(allocateDirect(SEND_BUFFER_CAPACITY));
+    private final UnsafeBuffer subscriptionReadyBuffer = new UnsafeBuffer(allocateDirect(SEND_BUFFER_CAPACITY));
+    private final UnsafeBuffer operationSuccessBuffer = new UnsafeBuffer(allocateDirect(SEND_BUFFER_CAPACITY));
     private final UnsafeBuffer errorMessageBuffer = new UnsafeBuffer(allocateDirect(SEND_BUFFER_CAPACITY));
 
     private final CopyBroadcastReceiver mockToClientReceiver = mock(CopyBroadcastReceiver.class);
@@ -110,7 +103,7 @@ public class ClientConductorTest
     private boolean suppressPrintError = false;
 
     @Before
-    public void setUp() throws Exception
+    public void setUp()
     {
         final Aeron.Context ctx = new Aeron.Context()
             .clientLock(mockClientLock)
@@ -122,11 +115,9 @@ public class ClientConductorTest
             .errorHandler(mockClientErrorHandler)
             .availableImageHandler(mockAvailableImageHandler)
             .unavailableImageHandler(mockUnavailableImageHandler)
-            .imageMapMode(READ_ONLY)
             .keepAliveInterval(KEEP_ALIVE_INTERVAL)
             .driverTimeoutMs(AWAIT_TIMEOUT)
-            .interServiceTimeout(TimeUnit.MILLISECONDS.toNanos(INTER_SERVICE_TIMEOUT_MS))
-            .publicationConnectionTimeout(PUBLICATION_CONNECTION_TIMEOUT_MS);
+            .interServiceTimeout(TimeUnit.MILLISECONDS.toNanos(INTER_SERVICE_TIMEOUT_MS));
 
         ctx.countersValuesBuffer(counterValuesBuffer);
 
@@ -141,7 +132,8 @@ public class ClientConductorTest
         conductor = new ClientConductor(ctx);
 
         publicationReady.wrap(publicationReadyBuffer, 0);
-        correlatedMessage.wrap(correlatedMessageBuffer, 0);
+        subscriptionReady.wrap(subscriptionReadyBuffer, 0);
+        operationSuccess.wrap(operationSuccessBuffer, 0);
         errorResponse.wrap(errorMessageBuffer, 0);
 
         publicationReady.correlationId(CORRELATION_ID);
@@ -150,7 +142,7 @@ public class ClientConductorTest
         publicationReady.streamId(STREAM_ID_1);
         publicationReady.logFileName(SESSION_ID_1 + "-log");
 
-        correlatedMessage.correlationId(CLOSE_CORRELATION_ID);
+        operationSuccess.correlationId(CLOSE_CORRELATION_ID);
 
         final UnsafeBuffer[] termBuffersSession1 = new UnsafeBuffer[PARTITION_COUNT];
         final UnsafeBuffer[] termBuffersSession2 = new UnsafeBuffer[PARTITION_COUNT];
@@ -173,16 +165,18 @@ public class ClientConductorTest
         final LogBuffers logBuffersSession1 = mock(LogBuffers.class);
         final LogBuffers logBuffersSession2 = mock(LogBuffers.class);
 
-        when(logBuffersFactory.map(SESSION_ID_1 + "-log", READ_WRITE)).thenReturn(logBuffersSession1);
-        when(logBuffersFactory.map(SESSION_ID_2 + "-log", READ_WRITE)).thenReturn(logBuffersSession2);
-        when(logBuffersFactory.map(SESSION_ID_1 + "-log", READ_ONLY)).thenReturn(logBuffersSession1);
-        when(logBuffersFactory.map(SESSION_ID_2 + "-log", READ_ONLY)).thenReturn(logBuffersSession2);
+        when(logBuffersFactory.map(SESSION_ID_1 + "-log")).thenReturn(logBuffersSession1);
+        when(logBuffersFactory.map(SESSION_ID_2 + "-log")).thenReturn(logBuffersSession2);
+        when(logBuffersFactory.map(SESSION_ID_1 + "-log")).thenReturn(logBuffersSession1);
+        when(logBuffersFactory.map(SESSION_ID_2 + "-log")).thenReturn(logBuffersSession2);
 
-        when(logBuffersSession1.termBuffers()).thenReturn(termBuffersSession1);
-        when(logBuffersSession2.termBuffers()).thenReturn(termBuffersSession2);
+        when(logBuffersSession1.duplicateTermBuffers()).thenReturn(termBuffersSession1);
+        when(logBuffersSession2.duplicateTermBuffers()).thenReturn(termBuffersSession2);
 
         when(logBuffersSession1.metaDataBuffer()).thenReturn(logMetaDataSession1);
         when(logBuffersSession2.metaDataBuffer()).thenReturn(logMetaDataSession2);
+        when(logBuffersSession1.termLength()).thenReturn(TERM_BUFFER_LENGTH);
+        when(logBuffersSession2.termLength()).thenReturn(TERM_BUFFER_LENGTH);
     }
 
     // --------------------------------
@@ -190,7 +184,7 @@ public class ClientConductorTest
     // --------------------------------
 
     @Test
-    public void addPublicationShouldNotifyMediaDriver() throws Exception
+    public void addPublicationShouldNotifyMediaDriver()
     {
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_PUBLICATION_READY,
@@ -203,7 +197,7 @@ public class ClientConductorTest
     }
 
     @Test
-    public void addPublicationShouldMapLogFile() throws Exception
+    public void addPublicationShouldMapLogFile()
     {
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_PUBLICATION_READY,
@@ -212,7 +206,7 @@ public class ClientConductorTest
 
         conductor.addPublication(CHANNEL, STREAM_ID_1);
 
-        verify(logBuffersFactory).map(SESSION_ID_1 + "-log", READ_WRITE);
+        verify(logBuffersFactory).map(SESSION_ID_1 + "-log");
     }
 
     @Test(expected = DriverTimeoutException.class, timeout = 5_000)
@@ -222,21 +216,7 @@ public class ClientConductorTest
     }
 
     @Test
-    public void conductorShouldCachePublicationInstances()
-    {
-        whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_PUBLICATION_READY,
-            publicationReadyBuffer,
-            (buffer) -> publicationReady.length());
-
-        final Publication firstPublication = conductor.addPublication(CHANNEL, STREAM_ID_1);
-        final Publication secondPublication = conductor.addPublication(CHANNEL, STREAM_ID_1);
-
-        assertThat(firstPublication, sameInstance(secondPublication));
-    }
-
-    @Test
-    public void closingPublicationShouldNotifyMediaDriver() throws Exception
+    public void closingPublicationShouldNotifyMediaDriver()
     {
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_PUBLICATION_READY, publicationReadyBuffer, (buffer) -> publicationReady.length());
@@ -245,8 +225,8 @@ public class ClientConductorTest
 
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
-            (buffer) -> CorrelatedMessageFlyweight.LENGTH);
+            operationSuccessBuffer,
+            (buffer) -> OperationSucceededFlyweight.LENGTH);
 
         publication.close();
 
@@ -254,7 +234,7 @@ public class ClientConductorTest
     }
 
     @Test
-    public void closingPublicationShouldPurgeCache() throws Exception
+    public void closingPublicationShouldPurgeCache()
     {
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_PUBLICATION_READY, publicationReadyBuffer, (buffer) -> publicationReady.length());
@@ -263,8 +243,8 @@ public class ClientConductorTest
 
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
-            (buffer) -> CorrelatedMessageFlyweight.LENGTH);
+            operationSuccessBuffer,
+            (buffer) -> OperationSucceededFlyweight.LENGTH);
 
         firstPublication.close();
 
@@ -316,30 +296,7 @@ public class ClientConductorTest
     }
 
     @Test
-    public void publicationOnlyRemovedOnLastClose() throws Exception
-    {
-        whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_PUBLICATION_READY, publicationReadyBuffer, (buffer) -> publicationReady.length());
-
-        final Publication publication = conductor.addPublication(CHANNEL, STREAM_ID_1);
-        conductor.addPublication(CHANNEL, STREAM_ID_1);
-
-        publication.close();
-
-        verify(driverProxy, never()).removePublication(CORRELATION_ID);
-
-        whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
-            (buffer) -> CorrelatedMessageFlyweight.LENGTH);
-
-        publication.close();
-
-        verify(driverProxy).removePublication(CORRELATION_ID);
-    }
-
-    @Test
-    public void closingPublicationDoesNotRemoveOtherPublications() throws Exception
+    public void closingPublicationDoesNotRemoveOtherPublications()
     {
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_PUBLICATION_READY, publicationReadyBuffer, (buffer) -> publicationReady.length());
@@ -363,8 +320,8 @@ public class ClientConductorTest
 
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
-            (buffer) -> CorrelatedMessageFlyweight.LENGTH);
+            operationSuccessBuffer,
+            (buffer) -> OperationSucceededFlyweight.LENGTH);
 
         publication.close();
 
@@ -373,7 +330,7 @@ public class ClientConductorTest
     }
 
     @Test
-    public void shouldNotMapBuffersForUnknownCorrelationId() throws Exception
+    public void shouldNotMapBuffersForUnknownCorrelationId()
     {
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_PUBLICATION_READY,
@@ -397,7 +354,7 @@ public class ClientConductorTest
         final Publication publication = conductor.addPublication(CHANNEL, STREAM_ID_1);
         conductor.doWork();
 
-        verify(logBuffersFactory, times(1)).map(anyString(), any(FileChannel.MapMode.class));
+        verify(logBuffersFactory, times(1)).map(anyString());
         assertThat(publication.registrationId(), is(CORRELATION_ID));
     }
 
@@ -406,15 +363,15 @@ public class ClientConductorTest
     // ---------------------------------
 
     @Test
-    public void addSubscriptionShouldNotifyMediaDriver() throws Exception
+    public void addSubscriptionShouldNotifyMediaDriver()
     {
         whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
+            ControlProtocolEvents.ON_SUBSCRIPTION_READY,
+            subscriptionReadyBuffer,
             (buffer) ->
             {
-                correlatedMessage.correlationId(CORRELATION_ID);
-                return CorrelatedMessageFlyweight.LENGTH;
+                subscriptionReady.correlationId(CORRELATION_ID);
+                return SubscriptionReadyFlyweight.LENGTH;
             });
 
         conductor.addSubscription(CHANNEL, STREAM_ID_1);
@@ -426,22 +383,22 @@ public class ClientConductorTest
     public void closingSubscriptionShouldNotifyMediaDriver()
     {
         whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
+            ControlProtocolEvents.ON_SUBSCRIPTION_READY,
+            subscriptionReadyBuffer,
             (buffer) ->
             {
-                correlatedMessage.correlationId(CORRELATION_ID);
-                return CorrelatedMessageFlyweight.LENGTH;
+                subscriptionReady.correlationId(CORRELATION_ID);
+                return SubscriptionReadyFlyweight.LENGTH;
             });
 
         final Subscription subscription = conductor.addSubscription(CHANNEL, STREAM_ID_1);
 
         whenReceiveBroadcastOnMessage(
             ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
+            operationSuccessBuffer,
             (buffer) ->
             {
-                correlatedMessage.correlationId(CLOSE_CORRELATION_ID);
+                operationSuccess.correlationId(CLOSE_CORRELATION_ID);
                 return CorrelatedMessageFlyweight.LENGTH;
             });
 
@@ -477,12 +434,12 @@ public class ClientConductorTest
     public void clientNotifiedOfNewImageShouldMapLogFile()
     {
         whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
+            ControlProtocolEvents.ON_SUBSCRIPTION_READY,
+            subscriptionReadyBuffer,
             (buffer) ->
             {
-                correlatedMessage.correlationId(CORRELATION_ID);
-                return CorrelatedMessageFlyweight.LENGTH;
+                subscriptionReady.correlationId(CORRELATION_ID);
+                return SubscriptionReadyFlyweight.LENGTH;
             });
 
         final Subscription subscription = conductor.addSubscription(CHANNEL, STREAM_ID_1);
@@ -492,23 +449,23 @@ public class ClientConductorTest
             STREAM_ID_1,
             SESSION_ID_1,
             subscription.registrationId(),
-            SUBSCRIBER_POSITION_ID,
+            SUBSCRIPTION_POSITION_ID,
             SESSION_ID_1 + "-log",
             SOURCE_INFO);
 
-        verify(logBuffersFactory).map(eq(SESSION_ID_1 + "-log"), any(FileChannel.MapMode.class));
+        verify(logBuffersFactory).map(eq(SESSION_ID_1 + "-log"));
     }
 
     @Test
     public void clientNotifiedOfNewAndInactiveImages()
     {
         whenReceiveBroadcastOnMessage(
-            ControlProtocolEvents.ON_OPERATION_SUCCESS,
-            correlatedMessageBuffer,
+            ControlProtocolEvents.ON_SUBSCRIPTION_READY,
+            subscriptionReadyBuffer,
             (buffer) ->
             {
-                correlatedMessage.correlationId(CORRELATION_ID);
-                return CorrelatedMessageFlyweight.LENGTH;
+                subscriptionReady.correlationId(CORRELATION_ID);
+                return SubscriptionReadyFlyweight.LENGTH;
             });
 
         final Subscription subscription = conductor.addSubscription(CHANNEL, STREAM_ID_1);
@@ -518,17 +475,19 @@ public class ClientConductorTest
             STREAM_ID_1,
             SESSION_ID_1,
             subscription.registrationId(),
-            SUBSCRIBER_POSITION_ID,
+            SUBSCRIPTION_POSITION_ID,
             SESSION_ID_1 + "-log",
             SOURCE_INFO);
 
         assertFalse(subscription.hasNoImages());
+        assertTrue(subscription.isConnected());
         verify(mockAvailableImageHandler).onAvailableImage(any(Image.class));
 
-        conductor.onUnavailableImage(CORRELATION_ID, STREAM_ID_1);
+        conductor.onUnavailableImage(CORRELATION_ID, subscription.registrationId(), STREAM_ID_1);
 
         verify(mockUnavailableImageHandler).onUnavailableImage(any(Image.class));
         assertTrue(subscription.hasNoImages());
+        assertFalse(subscription.isConnected());
     }
 
     @Test
@@ -538,26 +497,26 @@ public class ClientConductorTest
             CORRELATION_ID_2,
             STREAM_ID_2,
             SESSION_ID_2,
-            SUBSCRIBER_POSITION_REGISTRATION_ID,
-            SUBSCRIBER_POSITION_ID,
+            SUBSCRIPTION_POSITION_REGISTRATION_ID,
+            SUBSCRIPTION_POSITION_ID,
             SESSION_ID_2 + "-log",
             SOURCE_INFO);
 
-        verify(logBuffersFactory, never()).map(anyString(), any(FileChannel.MapMode.class));
+        verify(logBuffersFactory, never()).map(anyString());
         verify(mockAvailableImageHandler, never()).onAvailableImage(any(Image.class));
     }
 
     @Test
     public void shouldIgnoreUnknownInactiveImage()
     {
-        conductor.onUnavailableImage(CORRELATION_ID_2, STREAM_ID_2);
+        conductor.onUnavailableImage(CORRELATION_ID_2, SUBSCRIPTION_POSITION_REGISTRATION_ID, STREAM_ID_2);
 
-        verify(logBuffersFactory, never()).map(anyString(), any(FileChannel.MapMode.class));
+        verify(logBuffersFactory, never()).map(anyString());
         verify(mockUnavailableImageHandler, never()).onUnavailableImage(any(Image.class));
     }
 
     @Test
-    public void shouldTimeoutInterServiceIfTooLongBetweenDoWorkCalls() throws Exception
+    public void shouldTimeoutInterServiceIfTooLongBetweenDoWorkCalls()
     {
         suppressPrintError = true;
 
@@ -568,6 +527,8 @@ public class ClientConductorTest
         conductor.doWork();
 
         verify(mockClientErrorHandler).onError(any(ConductorServiceTimeoutException.class));
+
+        assertTrue(conductor.isClosed());
     }
 
     private void whenReceiveBroadcastOnMessage(
@@ -580,7 +541,8 @@ public class ClientConductorTest
                 conductor.driverListenerAdapter().onMessage(msgTypeId, buffer, 0, length);
 
                 return 1;
-            }).when(mockToClientReceiver).receive(any());
+            })
+            .when(mockToClientReceiver).receive(any(MessageHandler.class));
     }
 
     private class PrintError implements ErrorHandler

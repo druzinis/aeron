@@ -16,6 +16,7 @@
 package io.aeron;
 
 import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import io.aeron.logbuffer.FragmentHandler;
 import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
@@ -54,19 +55,22 @@ public class ExclusivePublicationTest
 
     @Theory
     @Test(timeout = 10000)
-    public void shouldPublishFromIndependentExclusivePublications(final String channel) throws Exception
+    public void shouldPublishFromIndependentExclusivePublications(final String channel)
     {
         final AtomicInteger imageCounter = new AtomicInteger();
         final AvailableImageHandler availableImageHandler = (image) -> imageCounter.getAndIncrement();
 
-        final MediaDriver.Context driverCtx = new MediaDriver.Context();
+        final MediaDriver.Context driverCtx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
+            .threadingMode(ThreadingMode.SHARED);
+
         final Aeron.Context clientCtx = new Aeron.Context().availableImageHandler(availableImageHandler);
 
         try (MediaDriver ignore = MediaDriver.launch(driverCtx);
-             Aeron aeron = Aeron.connect(clientCtx);
-             ExclusivePublication publicationOne = aeron.addExclusivePublication(channel, STREAM_ID);
-             ExclusivePublication publicationTwo = aeron.addExclusivePublication(channel, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(channel, STREAM_ID))
+            Aeron aeron = Aeron.connect(clientCtx);
+            ExclusivePublication publicationOne = aeron.addExclusivePublication(channel, STREAM_ID);
+            ExclusivePublication publicationTwo = aeron.addExclusivePublication(channel, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(channel, STREAM_ID))
         {
             final int expectedNumberOfFragments = 778;
 

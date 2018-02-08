@@ -15,13 +15,14 @@
  */
 
 #if defined(__linux__)
+#define _BSD_SOURCE
 #define _GNU_SOURCE
 #endif
 
 #include <sys/socket.h>
 #include <stdio.h>
 
-#if !defined(HAVE_RECVMMSG)
+#if !defined(HAVE_STRUCT_MMSGHDR)
 struct mmsghdr
 {
     struct msghdr msg_hdr;
@@ -84,6 +85,10 @@ int aeron_driver_sender_init(
         aeron_system_counter_addr(system_counters, AERON_SYSTEM_COUNTER_ERRORS);
     sender->invalid_frames_counter =
         aeron_system_counter_addr(system_counters, AERON_SYSTEM_COUNTER_INVALID_PACKETS);
+    sender->status_messages_received_counter =
+        aeron_system_counter_addr(system_counters, AERON_SYSTEM_COUNTER_STATUS_MESSAGES_RECEIVED);
+    sender->nak_messages_received_counter =
+        aeron_system_counter_addr(system_counters, AERON_SYSTEM_COUNTER_NAK_MESSAGES_RECEIVED);
     return 0;
 }
 
@@ -124,6 +129,8 @@ int aeron_driver_sender_do_work(void *clientd)
             mmsghdr[i].msg_hdr.msg_iov = &sender->recv_buffers.iov[i];
             mmsghdr[i].msg_hdr.msg_iovlen = 1;
             mmsghdr[i].msg_hdr.msg_flags = 0;
+            mmsghdr[i].msg_hdr.msg_control = NULL;
+            mmsghdr[i].msg_hdr.msg_controllen = 0;
             mmsghdr[i].msg_len = 0;
         }
 
@@ -195,7 +202,7 @@ void aeron_driver_sender_on_add_publication(void *clientd, void *command)
 
     int ensure_capacity_result = 0;
     AERON_ARRAY_ENSURE_CAPACITY(
-        ensure_capacity_result, sender->network_publicaitons, sizeof(aeron_driver_sender_network_publication_entry_t));
+        ensure_capacity_result, sender->network_publicaitons, aeron_driver_sender_network_publication_entry_t);
 
     if (ensure_capacity_result < 0)
     {
@@ -238,12 +245,34 @@ void aeron_driver_sender_on_remove_publication(void *clientd, void *command)
     aeron_network_publication_sender_release(publication);
 }
 
+void aeron_driver_sender_on_add_destination(void *clientd, void *command)
+{
+    aeron_driver_sender_t *sender = (aeron_driver_sender_t *)clientd;
+    aeron_command_destination_t *cmd = (aeron_command_destination_t *)command;
+
+    if (aeron_send_channel_endpoint_add_destination(cmd->endpoint, &cmd->control_address) < 0)
+    {
+        AERON_DRIVER_SENDER_ERROR(sender, "sender on_add_destination: %s", aeron_errmsg());
+    }
+}
+
+void aeron_driver_sender_on_remove_destination(void *clientd, void *command)
+{
+    aeron_driver_sender_t *sender = (aeron_driver_sender_t *)clientd;
+    aeron_command_destination_t *cmd = (aeron_command_destination_t *)command;
+
+    if (aeron_send_channel_endpoint_remove_destination(cmd->endpoint, &cmd->control_address) < 0)
+    {
+        AERON_DRIVER_SENDER_ERROR(sender, "sender on_remove_destination: %s", aeron_errmsg());
+    }
+}
+
 int aeron_driver_sender_do_send(aeron_driver_sender_t *sender, int64_t now_ns)
 {
     int bytes_sent = 0;
     aeron_driver_sender_network_publication_entry_t *publications = sender->network_publicaitons.array;
     size_t length = sender->network_publicaitons.length;
-    size_t starting_index = sender->round_robin_index;
+    size_t starting_index = sender->round_robin_index++;
 
     if (starting_index >= length)
     {

@@ -21,6 +21,7 @@
 #include <iostream>
 #include <atomic>
 #include <concurrent/logbuffer/TermReader.h>
+#include "concurrent/status/StatusIndicatorReader.h"
 #include "Image.h"
 
 namespace aeron {
@@ -49,7 +50,11 @@ class Subscription
 public:
     /// @cond HIDDEN_SYMBOLS
     Subscription(
-        ClientConductor& conductor, std::int64_t registrationId, const std::string& channel, std::int32_t streamId);
+        ClientConductor& conductor,
+        std::int64_t registrationId,
+        const std::string& channel,
+        std::int32_t streamId,
+        StatusIndicatorReader& channelStatusIndicator);
     /// @endcond
     virtual ~Subscription();
 
@@ -84,64 +89,138 @@ public:
     }
 
     /**
+     * Get the status indicator assigned to the channel of this {@link Subscription}
+     *
+     * @return status indicator reader for the channel
+     */
+    inline StatusIndicatorReader& channelStatusIndicator()
+    {
+        return m_channelStatusIndicator;
+    }
+
+    /**
+     * Poll the Image s under the subscription for having reached End of Stream.
+     *
+     * @param endOfStreamHandler callback for handling end of stream indication.
+     * @return number of Image s that have reached End of Stream.
+     */
+    template <typename F>
+    inline int pollEndOfStreams(F&& endOfStreamHandler)
+    {
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image *images = imageList->m_images;
+        int numEndOfStreams = 0;
+
+        for (std::size_t i = 0; i < length; i++)
+        {
+            if (images[i].isEndOfStream())
+            {
+                numEndOfStreams++;
+                endOfStreamHandler(images[i]);
+            }
+        }
+
+        return numEndOfStreams;
+    }
+
+    /**
      * Poll the {@link Image}s under the subscription for available message fragments.
      * <p>
      * Each fragment read will be a whole message if it is under MTU length. If larger than MTU then it will come
      * as a series of fragments ordered withing a session.
      *
      * @param fragmentHandler callback for handling each message fragment as it is read.
-     * @param fragmentLimit   number of message fragments to limit for the poll across multiple {@link Image}s.
+     * @param fragmentLimit   number of message fragments to limit for the poll across multiple Image s.
      * @return the number of fragments received
      *
-     * @see FragmentAssembler
+     * @see fragment_handler_t
      */
     template <typename F>
     inline int poll(F&& fragmentHandler, int fragmentLimit)
     {
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image *images = imageList->m_images;
         int fragmentsRead = 0;
-        const int length = std::atomic_load(&m_imagesLength);
-        Image *images = std::atomic_load(&m_images);
 
-        if (length > 0)
+        std::size_t startingIndex = m_roundRobinIndex++;
+        if (startingIndex >= length)
         {
-            int startingIndex = m_roundRobinIndex;
-            if (startingIndex >= length)
-            {
-                m_roundRobinIndex = startingIndex = 0;
-            }
+            m_roundRobinIndex = startingIndex = 0;
+        }
 
-            int i = startingIndex;
+        for (std::size_t i = startingIndex; i < length && fragmentsRead < fragmentLimit; i++)
+        {
+            fragmentsRead += images[i].poll(fragmentHandler, fragmentLimit - fragmentsRead);
+        }
 
-            do
-            {
-                fragmentsRead += images[i].poll(fragmentHandler, fragmentLimit - fragmentsRead);
-
-                if (++i == length)
-                {
-                    i = 0;
-                }
-            }
-            while (fragmentsRead < fragmentLimit && i != startingIndex);
+        for (std::size_t i = 0; i < startingIndex && fragmentsRead < fragmentLimit; i++)
+        {
+            fragmentsRead += images[i].poll(fragmentHandler, fragmentLimit - fragmentsRead);
         }
 
         return fragmentsRead;
     }
 
     /**
-     * Poll the {@link Image}s under the subscription for available message fragments in blocks.
+     * Poll in a controlled manner the Image s under the subscription for available message fragments.
+     * Control is applied to fragments in the stream. If more fragments can be read on another stream
+     * they will even if BREAK or ABORT is returned from the fragment handler.
+     * <p>
+     * Each fragment read will be a whole message if it is under MTU length. If larger than MTU then it will come
+     * as a series of fragments ordered within a session.
+     * <p>
+     * To assemble messages that span multiple fragments then use controlled_poll_fragment_handler_t.
      *
-     * @param blockHandler     to receive a block of fragments from each {@link Image}.
+     * @param fragmentHandler callback for handling each message fragment as it is read.
+     * @param fragmentLimit   number of message fragments to limit for the poll operation across multiple Image s.
+     * @return the number of fragments received
+     * @see controlled_poll_fragment_handler_t
+     */
+    template <typename F>
+    inline int controlledPoll(F&& fragmentHandler, int fragmentLimit)
+    {
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image *images = imageList->m_images;
+        int fragmentsRead = 0;
+
+        std::size_t startingIndex = m_roundRobinIndex++;
+        if (startingIndex >= length)
+        {
+            m_roundRobinIndex = startingIndex = 0;
+        }
+
+        for (std::size_t i = startingIndex; i < length && fragmentsRead < fragmentLimit; i++)
+        {
+            fragmentsRead += images[i].controlledPoll(fragmentHandler, fragmentLimit - fragmentsRead);
+        }
+
+        for (std::size_t i = 0; i < startingIndex && fragmentsRead < fragmentLimit; i++)
+        {
+            fragmentsRead += images[i].controlledPoll(fragmentHandler, fragmentLimit - fragmentsRead);
+        }
+
+        return fragmentsRead;
+    }
+
+    /**
+     * Poll the Image s under the subscription for available message fragments in blocks.
+     *
+     * @param blockHandler     to receive a block of fragments from each Image.
      * @param blockLengthLimit for each individual block.
      * @return the number of bytes consumed.
      */
     template <typename F>
     inline long blockPoll(F&& blockHandler, int blockLengthLimit)
     {
-        const int length = std::atomic_load(&m_imagesLength);
-        Image *images = std::atomic_load(&m_images);
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image *images = imageList->m_images;
         long bytesConsumed = 0;
 
-        for (int i = 0; i < length; i++)
+        for (std::size_t i = 0; i < length; i++)
         {
             bytesConsumed += images[i].blockPoll(blockHandler, blockLengthLimit);
         }
@@ -149,7 +228,15 @@ public:
         return bytesConsumed;
     }
 
-    // TODO: add filePoll to return MemoryMappedFile
+    /**
+     * Is the subscription connected by having at least one image available.
+     *
+     * @return true if the subscription has more than one image available.
+     */
+    inline bool isConnected() const
+    {
+        return std::atomic_load_explicit(&m_imageList, std::memory_order_acquire)->m_length > 0;
+    }
 
     /**
      * Count of images connected to this subscription.
@@ -158,7 +245,7 @@ public:
      */
     inline int imageCount() const
     {
-        return std::atomic_load(&m_imagesLength);
+        return static_cast<int>(std::atomic_load_explicit(&m_imageList, std::memory_order_acquire)->m_length);
     }
 
     /**
@@ -170,13 +257,14 @@ public:
      * @param sessionId associated with the Image.
      * @return Image associated with the given sessionId or nullptr if no Image exist.
      */
-    inline std::shared_ptr<Image> imageBySessionId(std::int32_t sessionId)
+    inline std::shared_ptr<Image> imageBySessionId(std::int32_t sessionId) const
     {
-        const int length = std::atomic_load(&m_imagesLength);
-        Image* images = std::atomic_load(&m_images);
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image* images = imageList->m_images;
         int index = -1;
 
-        for (int i = 0; i < length; i++)
+        for (int i = 0; i < static_cast<int>(length); i++)
         {
             if (images[i].sessionId() == sessionId)
             {
@@ -186,6 +274,27 @@ public:
         }
 
         return (index != -1) ? std::shared_ptr<Image>(new Image(images[index])) : std::shared_ptr<Image>();
+    }
+
+    /**
+     * Get the image at the given index from the images array.
+     *
+     * This is only valid until the image list changes.
+     *
+     * @param index in the array
+     * @return image at given index or exception if out of range.
+     */
+    inline Image& imageAtIndex(size_t index) const
+    {
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        Image *images = imageList->m_images;
+
+        if (index >= imageList->m_length)
+        {
+            throw std::out_of_range("image index out of range");
+        }
+
+        return images[index];
     }
 
     /**
@@ -211,17 +320,19 @@ public:
      *
      * @return length of Image list
      */
-    inline int forEachImage(const std::function<void(Image&)> func)
+    template <typename F>
+    inline int forEachImage(F&& func)
     {
-        const int length = std::atomic_load(&m_imagesLength);
-        Image* images = std::atomic_load(&m_images);
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image* images = imageList->m_images;
 
-        for (int i = 0; i < length; i++)
+        for (std::size_t i = 0; i < length; i++)
         {
             func(images[i]);
         }
 
-        return length;
+        return static_cast<int>(length);
     }
 
     /**
@@ -229,19 +340,20 @@ public:
      *
      * @return true if it has been closed otherwise false.
      */
-    inline bool isClosed(void) const
+    inline bool isClosed() const
     {
-        return std::atomic_load_explicit(&m_isClosed, std::memory_order_relaxed);
+        return std::atomic_load_explicit(&m_isClosed, std::memory_order_acquire);
     }
 
     /// @cond HIDDEN_SYMBOLS
-    bool hasImage(std::int64_t correlationId)
+    bool hasImage(std::int64_t correlationId) const
     {
-        const int length = std::atomic_load(&m_imagesLength);
-        Image *images = std::atomic_load(&m_images);
+        const struct ImageList *imageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        const std::size_t length = imageList->m_length;
+        Image *images = imageList->m_images;
         bool isConnected = false;
 
-        for (int i = 0; i < length; i++)
+        for (std::size_t i = 0; i < length; i++)
         {
             if (images[i].correlationId() == correlationId)
             {
@@ -253,30 +365,32 @@ public:
         return isConnected;
     }
 
-    Image *addImage(Image &image)
+    struct ImageList *addImage(Image &image)
     {
-        Image * oldArray = std::atomic_load(&m_images);
-        int length = std::atomic_load(&m_imagesLength);
-        Image * newArray = new Image[length + 1];
+        struct ImageList *oldImageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        Image *oldArray = oldImageList->m_images;
+        std::size_t length = oldImageList->m_length;
+        auto newArray = new Image[length + 1];
 
-        for (int i = 0; i < length; i++)
+        for (std::size_t i = 0; i < length; i++)
         {
             newArray[i] = std::move(oldArray[i]);
         }
 
         newArray[length] = image; // copy-assign
 
-        std::atomic_store(&m_images, newArray);
-        std::atomic_store(&m_imagesLength, length + 1); // set length last. Don't go over end of old array on poll
+        auto newImageList = new struct ImageList(newArray, length + 1);
 
-        // oldArray to linger and be deleted by caller (aka client conductor)
-        return oldArray;
+        std::atomic_store_explicit(&m_imageList, newImageList, std::memory_order_release);
+
+        return oldImageList;
     }
 
-    std::pair<Image*, int> removeImage(std::int64_t correlationId)
+    std::pair<struct ImageList *, int> removeImage(std::int64_t correlationId)
     {
-        Image * oldArray = std::atomic_load(&m_images);
-        int length = std::atomic_load(&m_imagesLength);
+        struct ImageList *oldImageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        Image * oldArray = oldImageList->m_images;
+        auto length = static_cast<int>(oldImageList->m_length);
         int index = -1;
 
         for (int i = 0; i < length; i++)
@@ -290,7 +404,7 @@ public:
 
         if (-1 != index)
         {
-            Image * newArray = new Image[length - 1];
+            auto newArray = new Image[length - 1];
 
             for (int i = 0, j = 0; i < length; i++)
             {
@@ -300,46 +414,45 @@ public:
                 }
             }
 
-            std::atomic_store(&m_imagesLength, length - 1);  // set length first. Don't go over end of new array on poll
-            std::atomic_store(&m_images, newArray);
+            auto newImageList = new struct ImageList(newArray, length - 1);
+
+            std::atomic_store_explicit(&m_imageList, newImageList, std::memory_order_release);
         }
 
-        // oldArray to linger and be deleted by caller (aka client conductor)
-        return std::pair<Image *, int>(
-            (-1 != index) ? oldArray : nullptr,
-            index);
+        return std::pair<struct ImageList *,int>(
+                (-1 != index) ? oldImageList : nullptr,
+                index);
     }
 
-    std::pair<Image*, int> removeAndCloseAllImages(void)
+    struct ImageList *removeAndCloseAllImages()
     {
-        Image * oldArray = std::atomic_load(&m_images);
-        int length = std::atomic_load(&m_imagesLength);
+        struct ImageList *oldImageList = std::atomic_load_explicit(&m_imageList, std::memory_order_acquire);
+        Image *oldArray = oldImageList->m_images;
+        std::size_t length = oldImageList->m_length;
 
-        for (int i = 0; i < length; i++)
+        for (std::size_t i = 0; i < length; i++)
         {
             oldArray[i].close();
         }
 
-        std::atomic_store(&m_imagesLength, 0);  // set length first. Don't go over end of new array on poll
-        std::atomic_store(&m_images, new Image[0]);
+        auto newImageList = new struct ImageList(new Image[0], 0);
 
-        std::atomic_store_explicit(&m_isClosed, true, std::memory_order_relaxed);
+        std::atomic_store_explicit(&m_imageList, newImageList, std::memory_order_release);
+        std::atomic_store_explicit(&m_isClosed, true, std::memory_order_release);
 
-        // oldArray to linger and be deleted by caller (aka client conductor)
-        return std::pair<Image *, int>(oldArray, length);
+        return oldImageList;
     }
     /// @endcond
 
 private:
     ClientConductor& m_conductor;
     const std::string m_channel;
-    int m_roundRobinIndex = 0;
+    StatusIndicatorReader m_channelStatusIndicator;
+    std::size_t m_roundRobinIndex = 0;
     std::int64_t m_registrationId;
     std::int32_t m_streamId;
 
-    std::atomic<Image*> m_images;
-    std::atomic<int> m_imagesLength;
-
+    std::atomic<struct ImageList*> m_imageList;
     std::atomic<bool> m_isClosed;
 };
 

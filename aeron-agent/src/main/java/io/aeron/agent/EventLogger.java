@@ -79,8 +79,8 @@ public class EventLogger
         if (IS_FRAME_OUT_ENABLED)
         {
             final MutableDirectBuffer encodedBuffer = ENCODING_BUFFER.get();
-            final int encodedLength =
-                EventEncoder.encode(encodedBuffer, buffer, buffer.position(), buffer.remaining(), dstAddress);
+            final int encodedLength = EventEncoder.encode(
+                encodedBuffer, buffer, buffer.position(), buffer.remaining(), dstAddress);
 
             ringBuffer.write(EventCode.FRAME_OUT.id(), encodedBuffer, 0, encodedLength);
         }
@@ -122,6 +122,7 @@ public class EventLogger
     {
         final MutableDirectBuffer encodedBuffer = ENCODING_BUFFER.get();
         final int encodingLength = EventEncoder.encode(encodedBuffer, value);
+
         ringBuffer.write(code.id(), encodedBuffer, 0, encodingLength);
     }
 }

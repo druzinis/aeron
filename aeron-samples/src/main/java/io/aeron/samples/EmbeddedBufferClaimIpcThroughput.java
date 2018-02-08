@@ -28,6 +28,7 @@ import org.agrona.concurrent.SigInt;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
+import static org.agrona.SystemUtil.loadPropertiesFiles;
 import static org.agrona.UnsafeAccess.UNSAFE;
 
 public class EmbeddedBufferClaimIpcThroughput
@@ -40,7 +41,7 @@ public class EmbeddedBufferClaimIpcThroughput
 
     public static void main(final String[] args) throws Exception
     {
-        MediaDriver.loadPropertiesFiles(args);
+        loadPropertiesFiles(args);
 
         final AtomicBoolean running = new AtomicBoolean(true);
         SigInt.register(() -> running.set(false));
@@ -50,9 +51,9 @@ public class EmbeddedBufferClaimIpcThroughput
             .sharedIdleStrategy(new NoOpIdleStrategy());
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID))
         {
             final Subscriber subscriber = new Subscriber(running, subscription);
             final Thread subscriberThread = new Thread(subscriber);
@@ -99,7 +100,7 @@ public class EmbeddedBufferClaimIpcThroughput
                 final long bytesTransferred = newTotalBytes - lastTotalBytes;
 
                 System.out.format(
-                    "Duration %dms - %,d messages - %,d bytes%n",
+                    "Duration %dms - %,d messages - %,d payload bytes%n",
                     duration, bytesTransferred / MESSAGE_LENGTH, bytesTransferred);
 
                 lastTimeStamp = newTimeStamp;
@@ -189,7 +190,7 @@ public class EmbeddedBufferClaimIpcThroughput
 
         public void run()
         {
-            while (subscription.hasNoImages())
+            while (!subscription.isConnected())
             {
                 Thread.yield();
             }

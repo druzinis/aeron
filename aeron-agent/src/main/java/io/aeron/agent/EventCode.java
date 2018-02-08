@@ -16,10 +16,9 @@
 package io.aeron.agent;
 
 import org.agrona.MutableDirectBuffer;
-import org.agrona.collections.Int2ObjectHashMap;
 
 /**
- * Event types and encoding/decoding
+ * Event types and association for encoding/decoding.
  */
 public enum EventCode
 {
@@ -50,9 +49,20 @@ public enum EventCode
     CMD_IN_ADD_DESTINATION(30, EventDissector::dissectAsCommand),
     CMD_IN_REMOVE_DESTINATION(31, EventDissector::dissectAsCommand),
     CMD_IN_ADD_EXCLUSIVE_PUBLICATION(32, EventDissector::dissectAsCommand),
-    CMD_OUT_EXCLUSIVE_PUBLICATION_READY(33, EventDissector::dissectAsCommand);
+    CMD_OUT_EXCLUSIVE_PUBLICATION_READY(33, EventDissector::dissectAsCommand),
 
-    private static final Int2ObjectHashMap<EventCode> EVENT_CODE_BY_ID_MAP = new Int2ObjectHashMap<>();
+    CMD_OUT_ERROR(34, EventDissector::dissectAsCommand),
+
+    CMD_IN_ADD_COUNTER(35, EventDissector::dissectAsCommand),
+    CMD_IN_REMOVE_COUNTER(36, EventDissector::dissectAsCommand),
+    CMD_OUT_SUBSCRIPTION_READY(37, EventDissector::dissectAsCommand),
+    CMD_OUT_COUNTER_READY(38, EventDissector::dissectAsCommand),
+    CMD_OUT_ON_UNAVAILABLE_COUNTER(39, EventDissector::dissectAsCommand),
+
+    CMD_IN_CLIENT_CLOSE(40, EventDissector::dissectAsCommand);
+
+    private static final int MAX_ID = 63;
+    private static final EventCode[] EVENT_CODE_BY_ID = new EventCode[MAX_ID];
 
     @FunctionalInterface
     private interface DissectFunction
@@ -68,7 +78,13 @@ public enum EventCode
     {
         for (final EventCode code : EventCode.values())
         {
-            EVENT_CODE_BY_ID_MAP.put(code.id(), code);
+            final int id = code.id();
+            if (null != EVENT_CODE_BY_ID[id])
+            {
+                throw new IllegalArgumentException("Id already in use: " + id);
+            }
+
+            EVENT_CODE_BY_ID[id] = code;
         }
     }
 
@@ -97,7 +113,12 @@ public enum EventCode
 
     public static EventCode get(final int id)
     {
-        final EventCode code = EVENT_CODE_BY_ID_MAP.get(id);
+        if (id < 0 || id > MAX_ID)
+        {
+            throw new IllegalArgumentException("No EventCode for ID: " + id);
+        }
+
+        final EventCode code = EVENT_CODE_BY_ID[id];
 
         if (null == code)
         {

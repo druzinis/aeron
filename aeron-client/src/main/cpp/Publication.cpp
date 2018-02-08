@@ -27,6 +27,7 @@ Publication::Publication(
     std::int32_t streamId,
     std::int32_t sessionId,
     UnsafeBufferPosition& publicationLimit,
+    StatusIndicatorReader& channelStatusIndicator,
     std::shared_ptr<LogBuffers> buffers)
     :
     m_conductor(conductor),
@@ -34,6 +35,7 @@ Publication::Publication(
     m_channel(channel),
     m_registrationId(registrationId),
     m_originalRegistrationId(originalRegistrationId),
+    m_maxPossiblePosition(static_cast<int64_t>(buffers->atomicBuffer(0).capacity()) << 31),
     m_streamId(streamId),
     m_sessionId(sessionId),
     m_initialTermId(LogBufferDescriptor::initialTermId(m_logMetaDataBuffer)),
@@ -41,6 +43,7 @@ Publication::Publication(
     m_maxMessageLength(FrameDescriptor::computeMaxMessageLength(buffers->atomicBuffer(0).capacity())),
     m_positionBitsToShift(util::BitUtil::numberOfTrailingZeroes(buffers->atomicBuffer(0).capacity())),
     m_publicationLimit(publicationLimit),
+    m_channelStatusIndicator(channelStatusIndicator),
     m_logbuffers(buffers),
     m_headerWriter(LogBufferDescriptor::defaultFrameHeader(m_logMetaDataBuffer))
 {
@@ -63,18 +66,23 @@ Publication::~Publication()
     m_conductor.releasePublication(m_registrationId);
 }
 
-bool Publication::isPublicationConnected(std::int64_t timeOfLastStatusMessage) const
-{
-    return m_conductor.isPublicationConnected(timeOfLastStatusMessage);
-}
-
 void Publication::addDestination(const std::string& endpointChannel)
 {
+    if (isClosed())
+    {
+        throw util::IllegalStateException(std::string("Publication is closed"), SOURCEINFO);
+    }
+
     m_conductor.addDestination(m_registrationId, endpointChannel);
 }
 
 void Publication::removeDestination(const std::string& endpointChannel)
 {
+    if (isClosed())
+    {
+        throw util::IllegalStateException(std::string("Publication is closed"), SOURCEINFO);
+    }
+
     m_conductor.removeDestination(m_registrationId, endpointChannel);
 }
 

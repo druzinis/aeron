@@ -39,16 +39,18 @@ public class Receiver implements Agent, Consumer<ReceiverCmd>
     private final DataTransportPoller dataTransportPoller;
     private final OneToOneConcurrentArrayQueue<ReceiverCmd> commandQueue;
     private final AtomicCounter totalBytesReceived;
-    private final NanoClock clock;
+    private final NanoClock nanoClock;
     private final ArrayList<PublicationImage> publicationImages = new ArrayList<>();
     private final ArrayList<PendingSetupMessageFromSource> pendingSetupMessages = new ArrayList<>();
+    private final DriverConductorProxy conductorProxy;
 
     public Receiver(final MediaDriver.Context ctx)
     {
         dataTransportPoller = ctx.dataTransportPoller();
         commandQueue = ctx.receiverCommandQueue();
         totalBytesReceived = ctx.systemCounters().get(BYTES_RECEIVED);
-        clock = ctx.nanoClock();
+        nanoClock = ctx.cachedNanoClock();
+        conductorProxy = ctx.driverConductorProxy();
     }
 
     public void onClose()
@@ -61,34 +63,34 @@ public class Receiver implements Agent, Consumer<ReceiverCmd>
         return "receiver";
     }
 
-    public int doWork() throws Exception
+    public int doWork()
     {
-        int workCount = commandQueue.drain(this);
+        int workCount = commandQueue.drain(this, Configuration.COMMAND_DRAIN_LIMIT);
         final int bytesReceived = dataTransportPoller.pollTransports();
 
-        final long nowNs = clock.nanoTime();
+        final long nowNs = nanoClock.nanoTime();
 
         final ArrayList<PublicationImage> publicationImages = this.publicationImages;
         for (int lastIndex = publicationImages.size() - 1, i = lastIndex; i >= 0; i--)
         {
             final PublicationImage image = publicationImages.get(i);
-            if (!image.checkForActivity(nowNs))
-            {
-                image.removeFromDispatcher();
-                ArrayListUtil.fastUnorderedRemove(publicationImages, i, lastIndex);
-                lastIndex--;
-            }
-            else
+            if (image.hasActivityAndNotEndOfStream(nowNs))
             {
                 workCount += image.sendPendingStatusMessage();
                 workCount += image.processPendingLoss();
                 workCount += image.initiateAnyRttMeasurements(nowNs);
             }
+            else
+            {
+                image.removeFromDispatcher();
+                ArrayListUtil.fastUnorderedRemove(publicationImages, i, lastIndex);
+                lastIndex--;
+            }
         }
 
         checkPendingSetupMessages(nowNs);
 
-        totalBytesReceived.addOrdered(bytesReceived);
+        totalBytesReceived.getAndAddOrdered(bytesReceived);
 
         return workCount + bytesReceived;
     }
@@ -102,7 +104,8 @@ public class Receiver implements Agent, Consumer<ReceiverCmd>
     {
         final PendingSetupMessageFromSource cmd = new PendingSetupMessageFromSource(
             sessionId, streamId, channelEndpoint, periodic, controlAddress);
-        cmd.timeOfStatusMessageNs(clock.nanoTime());
+
+        cmd.timeOfStatusMessageNs(nanoClock.nanoTime());
         pendingSetupMessages.add(cmd);
     }
 
@@ -111,9 +114,21 @@ public class Receiver implements Agent, Consumer<ReceiverCmd>
         channelEndpoint.addSubscription(streamId);
     }
 
+    public void onAddSubscription(
+        final ReceiveChannelEndpoint channelEndpoint, final int streamId, final int sessionId)
+    {
+        channelEndpoint.addSubscription(streamId, sessionId);
+    }
+
     public void onRemoveSubscription(final ReceiveChannelEndpoint channelEndpoint, final int streamId)
     {
         channelEndpoint.removeSubscription(streamId);
+    }
+
+    public void onRemoveSubscription(
+        final ReceiveChannelEndpoint channelEndpoint, final int streamId, final int sessionId)
+    {
+        channelEndpoint.removeSubscription(streamId, sessionId);
     }
 
     public void onNewPublicationImage(final ReceiveChannelEndpoint channelEndpoint, final PublicationImage image)
@@ -124,7 +139,7 @@ public class Receiver implements Agent, Consumer<ReceiverCmd>
 
     public void onRegisterReceiveChannelEndpoint(final ReceiveChannelEndpoint channelEndpoint)
     {
-        channelEndpoint.openChannel();
+        channelEndpoint.openChannel(conductorProxy);
         channelEndpoint.registerForRead(dataTransportPoller);
         channelEndpoint.indicateActive();
 

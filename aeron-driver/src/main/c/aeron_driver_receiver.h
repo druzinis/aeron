@@ -26,11 +26,24 @@
 #define AERON_DRIVER_RECEIVER_NUM_RECV_BUFFERS (2)
 #define AERON_DRIVER_RECEIVER_MAX_UDP_PACKET_LENGTH (64 * 1024)
 
+#define AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS (1000 * 1000 * 1000L)
+
 typedef struct aeron_driver_receiver_image_entry_stct
 {
     aeron_publication_image_t *image;
 }
 aeron_driver_receiver_image_entry_t;
+
+typedef struct aeron_driver_receiver_pending_setup_entry_stct
+{
+    aeron_receive_channel_endpoint_t *endpoint;
+    int64_t time_of_status_message_ns;
+    int32_t session_id;
+    int32_t stream_id;
+    struct sockaddr_storage control_addr;
+    bool is_periodic;
+}
+aeron_driver_receiver_pending_setup_entry_t;
 
 typedef struct aeron_driver_receiver_stct
 {
@@ -53,11 +66,20 @@ typedef struct aeron_driver_receiver_stct
     }
     images;
 
+    struct aeron_driver_receiver_pending_setups_stct
+    {
+        aeron_driver_receiver_pending_setup_entry_t *array;
+        size_t length;
+        size_t capacity;
+    }
+    pending_setups;
+
     aeron_driver_context_t *context;
     aeron_distinct_error_log_t *error_log;
 
     int64_t *errors_counter;
     int64_t *invalid_frames_counter;
+    int64_t *total_bytes_received_counter;
 }
 aeron_driver_receiver_t;
 
@@ -90,5 +112,19 @@ void aeron_driver_receiver_on_remove_subscription(void *clientd, void *item);
 
 void aeron_driver_receiver_on_add_publication_image(void *clientd, void *item);
 void aeron_driver_receiver_on_remove_publication_image(void *clientd, void *item);
+
+void aeron_driver_receiver_on_remove_cooldown(void *clientd, void *item);
+
+int aeron_driver_receiver_add_pending_setup(
+    aeron_driver_receiver_t *receiver,
+    aeron_receive_channel_endpoint_t *endpoint,
+    int32_t session_id,
+    int32_t stream_id,
+    struct sockaddr_storage *control_addr);
+
+inline size_t aeron_driver_receiver_num_images(aeron_driver_receiver_t *receiver)
+{
+    return receiver->images.length;
+}
 
 #endif //AERON_AERON_DRIVER_RECEIVER_H

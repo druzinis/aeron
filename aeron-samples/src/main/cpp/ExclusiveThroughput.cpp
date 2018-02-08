@@ -90,7 +90,7 @@ void printRate(double messagesPerSec, double bytesPerSec, long totalFragments, l
     if (printingActive)
     {
         std::printf(
-            "%.02g msgs/sec, %.02g bytes/sec, totals %ld messages %ld MB\n",
+            "%.02g msgs/sec, %.02g bytes/sec, totals %ld messages %ld MB payloads\n",
             messagesPerSec, bytesPerSec, totalFragments, totalBytes / (1024 * 1024));
     }
 }
@@ -126,7 +126,7 @@ int main(int argc, char **argv)
 
         std::cout << "Subscribing to channel " << settings.channel << " on Stream ID " << settings.streamId << std::endl;
 
-        std::cout << "Streaming " << toStringWithCommas(settings.numberOfMessages) << " messages of size "
+        std::cout << "Streaming " << toStringWithCommas(settings.numberOfMessages) << " messages of payload length "
             << settings.messageLength << " bytes to "
             << settings.channel << " on stream ID "
             << settings.streamId << std::endl;
@@ -181,37 +181,49 @@ int main(int argc, char **argv)
             publication = aeron.findExclusivePublication(publicationId);
         }
 
-        BusySpinIdleStrategy offerIdleStrategy;
-
         RateReporter rateReporter(std::chrono::seconds(1), printRate);
         FragmentAssembler fragmentAssembler(rateReporterHandler(rateReporter));
-        fragment_handler_t handler = fragmentAssembler.handler();
+        auto handler = fragmentAssembler.handler();
 
         std::shared_ptr<std::thread> rateReporterThread;
 
         ExclusivePublication *publicationPtr = publication.get();
+        Subscription *subscriptionPtr = subscription.get();
 
         if (settings.progress)
         {
             rateReporterThread = std::make_shared<std::thread>([&rateReporter](){ rateReporter.run(); });
         }
 
-        std::thread pollThread([&subscription, &settings, &handler]()
+        std::uint64_t failedPolls = 0;
+        std::uint64_t successfulPolls = 0;
+
+        std::thread pollThread([&]()
         {
-            BusySpinIdleStrategy pollIdleStrategy;
+            while (0 == subscriptionPtr->imageCount())
+            {
+                std::this_thread::yield();
+            }
+
+            Image& image = subscriptionPtr->imageAtIndex(0);
 
             while (isRunning())
             {
-                const int fragmentsRead = subscription->poll(handler, settings.fragmentCountLimit);
-
-                pollIdleStrategy.idle(fragmentsRead);
+                if (0 == image.poll(handler, settings.fragmentCountLimit))
+                {
+                    ++failedPolls;
+                }
+                else
+                {
+                    ++successfulPolls;
+                }
             }
         });
 
         do
         {
             ExclusiveBufferClaim bufferClaim;
-            long backPressureCount = 0;
+            std::uint64_t backPressureCount = 0;
 
             printingActive = true;
 
@@ -224,8 +236,11 @@ int main(int argc, char **argv)
             {
                 while (publicationPtr->tryClaim(settings.messageLength, bufferClaim) < 0L)
                 {
-                    backPressureCount++;
-                    offerIdleStrategy.idle(0);
+                    ++backPressureCount;
+                    if (!isRunning())
+                    {
+                        break;
+                    }
                 }
 
                 bufferClaim.buffer().putInt64(bufferClaim.offset(), i);
@@ -237,8 +252,12 @@ int main(int argc, char **argv)
                 rateReporter.report();
             }
 
-            std::cout << "Done streaming. Back pressure ratio ";
+            std::cout << "Done streaming." << std::endl;
+            std::cout << "Publication back pressure ratio ";
             std::cout << ((double)backPressureCount / settings.numberOfMessages) << std::endl;
+
+            std::cout << "Subscription failure ratio ";
+            std::cout << ((double)failedPolls / (failedPolls + successfulPolls)) << std::endl;
 
             if (isRunning() && settings.lingerTimeoutMs > 0)
             {

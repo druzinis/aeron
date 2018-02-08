@@ -15,10 +15,12 @@
  */
 package io.aeron;
 
+import io.aeron.exceptions.DriverTimeoutException;
 import org.agrona.IoUtil;
 import org.agrona.SystemUtil;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
+import org.agrona.concurrent.errors.ErrorConsumer;
 import org.agrona.concurrent.errors.ErrorLogReader;
 import org.agrona.concurrent.ringbuffer.ManyToOneRingBuffer;
 
@@ -30,6 +32,7 @@ import java.util.Date;
 import java.util.UUID;
 import java.util.function.Consumer;
 
+import static io.aeron.Aeron.sleep;
 import static io.aeron.CncFileDescriptor.CNC_VERSION;
 import static java.lang.Long.getLong;
 import static java.lang.System.getProperty;
@@ -115,7 +118,8 @@ public class CommonContext implements AutoCloseable
     public static final String TERM_LENGTH_PARAM_NAME = "term-length";
 
     /**
-     * MTU length parameter name for using as a channel URI param.
+     * MTU length parameter name for using as a channel URI param. If this is greater than the network MTU for UDP
+     * then the packet will be fragmented and can amplify the impact of loss.
      */
     public static final String MTU_LENGTH_PARAM_NAME = "mtu";
 
@@ -135,9 +139,24 @@ public class CommonContext implements AutoCloseable
     public static final String MDC_CONTROL_MODE_PARAM_NAME = "control-mode";
 
     /**
+     * Key for the session id for a publication or restricted subscription.
+     */
+    public static final String SESSION_ID_PARAM_NAME = "session-id";
+
+    /**
+     * Key for the linger timeout for a publication to wait around after draining in nanoseconds.
+     */
+    public static final String LINGER_PARAM_NAME = "linger";
+
+    /**
      * Valid value for {@link #MDC_CONTROL_MODE_PARAM_NAME} when manual control is desired.
      */
     public static final String MDC_CONTROL_MODE_MANUAL = "manual";
+
+    /**
+     * Valid value for {@link #MDC_CONTROL_MODE_PARAM_NAME} when dynamic control is desired. Default value.
+     */
+    public static final String MDC_CONTROL_MODE_DYNAMIC = "dynamic";
 
     /**
      * Parameter name for channel URI param to indicate if a subscribed must be reliable or not. Value is boolean.
@@ -180,7 +199,7 @@ public class CommonContext implements AutoCloseable
      */
     public static String generateRandomDirName()
     {
-        return AERON_DIR_PROP_DEFAULT + "-" + UUID.randomUUID().toString();
+        return AERON_DIR_PROP_DEFAULT + '-' + UUID.randomUUID().toString();
     }
 
     /**
@@ -249,7 +268,7 @@ public class CommonContext implements AutoCloseable
      * of the data buffers.
      *
      * @param dirName New top level Aeron directory.
-     * @return this Object for method chaining.
+     * @return this for a fluent API.
      */
     public CommonContext aeronDirectoryName(final String dirName)
     {
@@ -282,7 +301,7 @@ public class CommonContext implements AutoCloseable
      * Set the buffer containing the counter meta data. Testing/internal purposes only.
      *
      * @param countersMetaDataBuffer The new counter meta data buffer.
-     * @return this Object for method chaining.
+     * @return this for a fluent API.
      */
     public CommonContext countersMetaDataBuffer(final UnsafeBuffer countersMetaDataBuffer)
     {
@@ -304,7 +323,7 @@ public class CommonContext implements AutoCloseable
      * Set the buffer containing the counters. Testing/internal purposes only.
      *
      * @param countersValuesBuffer The new counters buffer.
-     * @return this Object for method chaining.
+     * @return this for a fluent API.
      */
     public CommonContext countersValuesBuffer(final UnsafeBuffer countersValuesBuffer)
     {
@@ -326,7 +345,7 @@ public class CommonContext implements AutoCloseable
      * Set the driver timeout in milliseconds
      *
      * @param driverTimeoutMs to indicate liveness of driver
-     * @return driver timeout in milliseconds
+     * @return this for a fluent API.
      */
     public CommonContext driverTimeoutMs(final long driverTimeoutMs)
     {
@@ -355,18 +374,18 @@ public class CommonContext implements AutoCloseable
     /**
      * Map the CnC file if it exists.
      *
-     * @param logProgress for feedback
+     * @param logger for feedback
      * @return a new mapping for the file if it exists otherwise null;
      */
-    public MappedByteBuffer mapExistingCncFile(final Consumer<String> logProgress)
+    public MappedByteBuffer mapExistingCncFile(final Consumer<String> logger)
     {
         final File cncFile = new File(aeronDirectory, CncFileDescriptor.CNC_FILE);
 
         if (cncFile.exists())
         {
-            if (null != logProgress)
+            if (null != logger)
             {
-                logProgress.accept("INFO: Aeron CnC file " + cncFile + " exists");
+                logger.accept("INFO: Aeron CnC file exists: " + cncFile);
             }
 
             return IoUtil.mapExistingFile(cncFile, CncFileDescriptor.CNC_FILE);
@@ -380,22 +399,22 @@ public class CommonContext implements AutoCloseable
      *
      * @param directory       to check
      * @param driverTimeoutMs for the driver liveness check.
-     * @param logProgress     for feedback as liveness checked.
+     * @param logger          for feedback as liveness checked.
      * @return true if a driver is active or false if not.
      */
     public static boolean isDriverActive(
-        final File directory, final long driverTimeoutMs, final Consumer<String> logProgress)
+        final File directory, final long driverTimeoutMs, final Consumer<String> logger)
     {
         final File cncFile = new File(directory, CncFileDescriptor.CNC_FILE);
 
         if (cncFile.exists())
         {
-            logProgress.accept("INFO: Aeron CnC file " + cncFile + " exists");
+            logger.accept("INFO: Aeron CnC file exists: " + cncFile);
 
             final MappedByteBuffer cncByteBuffer = IoUtil.mapExistingFile(cncFile, "CnC file");
             try
             {
-                return isDriverActive(driverTimeoutMs, logProgress, cncByteBuffer);
+                return isDriverActive(driverTimeoutMs, logger, cncByteBuffer);
             }
             finally
             {
@@ -410,15 +429,15 @@ public class CommonContext implements AutoCloseable
      * Is a media driver active in the current Aeron directory?
      *
      * @param driverTimeoutMs for the driver liveness check.
-     * @param logHandler      for feedback as liveness checked.
+     * @param logger          for feedback as liveness checked.
      * @return true if a driver is active or false if not.
      */
-    public boolean isDriverActive(final long driverTimeoutMs, final Consumer<String> logHandler)
+    public boolean isDriverActive(final long driverTimeoutMs, final Consumer<String> logger)
     {
-        final MappedByteBuffer cncByteBuffer = mapExistingCncFile(logHandler);
+        final MappedByteBuffer cncByteBuffer = mapExistingCncFile(logger);
         try
         {
-            return isDriverActive(driverTimeoutMs, logHandler, cncByteBuffer);
+            return isDriverActive(driverTimeoutMs, logger, cncByteBuffer);
         }
         finally
         {
@@ -427,15 +446,16 @@ public class CommonContext implements AutoCloseable
     }
 
     /**
-     * Is a media driver active in the current mapped CnC buffer?
+     * Is a media driver active in the current mapped CnC buffer? If the driver is mid start then it will wait for
+     * up to the driverTimeoutMs by checking for the cncVersion being set.
      *
      * @param driverTimeoutMs for the driver liveness check.
-     * @param logProgress     for feedback as liveness checked.
+     * @param logger          for feedback as liveness checked.
      * @param cncByteBuffer   for the existing CnC file.
      * @return true if a driver is active or false if not.
      */
     public static boolean isDriverActive(
-        final long driverTimeoutMs, final Consumer<String> logProgress, final MappedByteBuffer cncByteBuffer)
+        final long driverTimeoutMs, final Consumer<String> logger, final MappedByteBuffer cncByteBuffer)
     {
         if (null == cncByteBuffer)
         {
@@ -443,12 +463,23 @@ public class CommonContext implements AutoCloseable
         }
 
         final UnsafeBuffer cncMetaDataBuffer = CncFileDescriptor.createMetaDataBuffer(cncByteBuffer);
-        final int cncVersion = cncMetaDataBuffer.getInt(CncFileDescriptor.cncVersionOffset(0));
+
+        final long startTimeMs = System.currentTimeMillis();
+        int cncVersion;
+        while (0 == (cncVersion = cncMetaDataBuffer.getIntVolatile(CncFileDescriptor.cncVersionOffset(0))))
+        {
+            if (System.currentTimeMillis() > (startTimeMs + driverTimeoutMs))
+            {
+                throw new DriverTimeoutException("CnC file is created but not initialised.");
+            }
+
+            sleep(1);
+        }
 
         if (CNC_VERSION != cncVersion)
         {
             throw new IllegalStateException(
-                "Aeron CnC version does not match: version=" + cncVersion + " required=" + CNC_VERSION);
+                "Aeron CnC version does not match: required=" + CNC_VERSION + " version=" + cncVersion);
         }
 
         final ManyToOneRingBuffer toDriverBuffer = new ManyToOneRingBuffer(
@@ -456,11 +487,11 @@ public class CommonContext implements AutoCloseable
 
         final long timestamp = toDriverBuffer.consumerHeartbeatTime();
         final long now = System.currentTimeMillis();
-        final long diff = now - timestamp;
+        final long timestampAge = now - timestamp;
 
-        logProgress.accept("INFO: Aeron toDriver consumer heartbeat is " + diff + "ms old");
+        logger.accept("INFO: Aeron toDriver consumer heartbeat is (ms): " + timestampAge);
 
-        return diff <= driverTimeoutMs;
+        return timestampAge <= driverTimeoutMs;
     }
 
     /**
@@ -502,21 +533,15 @@ public class CommonContext implements AutoCloseable
         if (CNC_VERSION != cncVersion)
         {
             throw new IllegalStateException(
-                "Aeron CnC version does not match: version=" + cncVersion + " required=" + CNC_VERSION);
+                "Aeron CnC version does not match: required=" + CNC_VERSION + " version=" + cncVersion);
         }
 
         final AtomicBuffer buffer = CncFileDescriptor.createErrorLogBuffer(cncByteBuffer, cncMetaDataBuffer);
         final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSZ");
+        final ErrorConsumer errorConsumer = (count, firstTimestamp, lastTimestamp, ex) ->
+            formatError(out, dateFormat, count, firstTimestamp, lastTimestamp, ex);
 
-        final int distinctErrorCount = ErrorLogReader.read(
-            buffer,
-            (observationCount, firstObservationTimestamp, lastObservationTimestamp, encodedException) ->
-                out.format(
-                    "***%n%d observations from %s to %s for:%n %s%n",
-                    observationCount,
-                    dateFormat.format(new Date(firstObservationTimestamp)),
-                    dateFormat.format(new Date(lastObservationTimestamp)),
-                    encodedException));
+        final int distinctErrorCount = ErrorLogReader.read(buffer, errorConsumer);
 
         out.format("%n%d distinct errors observed.%n", distinctErrorCount);
 
@@ -528,5 +553,21 @@ public class CommonContext implements AutoCloseable
      */
     public void close()
     {
+    }
+
+    public static void formatError(
+        final PrintStream out,
+        final SimpleDateFormat dateFormat,
+        final int observationCount,
+        final long firstObservationTimestamp,
+        final long lastObservationTimestamp,
+        final String encodedException)
+    {
+        out.format(
+            "***%n%d observations from %s to %s for:%n %s%n",
+            observationCount,
+            dateFormat.format(new Date(firstObservationTimestamp)),
+            dateFormat.format(new Date(lastObservationTimestamp)),
+            encodedException);
     }
 }

@@ -26,10 +26,9 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Basic Aeron publisher application
- * This publisher sends a fixed number of fixed-length messages
- * on a channel and stream ID, then lingers to allow any consumers
- * that may have experienced loss a chance to NAK for and recover
- * any missing data.
+ * This publisher sends a fixed number of messages on a channel and stream ID,
+ * then lingers to allow any consumers that may have experienced loss a chance to NAK for
+ * and recover any missing data.
  * The default values for number of messages, channel, and stream ID are
  * defined in {@link SampleConfiguration} and can be overridden by
  * setting their corresponding properties via the command-line; e.g.:
@@ -63,9 +62,9 @@ public class BasicPublisher
         // The Aeron and Publication classes implement "AutoCloseable" and will automatically
         // clean up resources when this try block is finished
         try (Aeron aeron = Aeron.connect(ctx);
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID))
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID))
         {
-            for (int i = 0; i < NUMBER_OF_MESSAGES; i++)
+            for (long i = 0; i < NUMBER_OF_MESSAGES; i++)
             {
                 final String message = "Hello World! " + i;
                 final byte[] messageBytes = message.getBytes();
@@ -94,6 +93,11 @@ public class BasicPublisher
                         System.out.println("Offer failed publication is closed");
                         break;
                     }
+                    else if (result == Publication.MAX_POSITION_EXCEEDED)
+                    {
+                        System.out.println("Offer failed due to publication reaching max position");
+                        break;
+                    }
                     else
                     {
                         System.out.println("Offer failed due to unknown reason");
@@ -114,7 +118,7 @@ public class BasicPublisher
 
             System.out.println("Done sending.");
 
-            if (0 < LINGER_TIMEOUT_MS)
+            if (LINGER_TIMEOUT_MS > 0)
             {
                 System.out.println("Lingering for " + LINGER_TIMEOUT_MS + " milliseconds...");
                 Thread.sleep(LINGER_TIMEOUT_MS);

@@ -26,6 +26,7 @@ import org.junit.experimental.theories.Theories;
 import org.junit.experimental.theories.Theory;
 import org.junit.runner.RunWith;
 
+import static io.aeron.SystemTestHelper.spyForChannel;
 import static org.mockito.Mockito.*;
 
 @RunWith(Theories.class)
@@ -46,16 +47,16 @@ public class SpySubscriptionTest
 
     @Theory
     @Test(timeout = 10000)
-    public void shouldReceivePublishedMessage(final String channel) throws Exception
+    public void shouldReceivePublishedMessage(final String channel)
     {
-        final MediaDriver.Context ctx = new MediaDriver.Context();
-        final Aeron.Context aeronCtx = new Aeron.Context();
+        final MediaDriver.Context ctx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace);
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect(aeronCtx);
-             Publication publication = aeron.addPublication(channel, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(channel, STREAM_ID);
-             Subscription spy = aeron.addSubscription(spyForChannel(channel), STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(channel, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(channel, STREAM_ID);
+            Subscription spy = aeron.addSubscription(spyForChannel(channel), STREAM_ID))
         {
             final UnsafeBuffer srcBuffer = new UnsafeBuffer(new byte[PAYLOAD_LENGTH * 4]);
 
@@ -90,10 +91,5 @@ public class SpySubscriptionTest
         {
             ctx.deleteAeronDirectory();
         }
-    }
-
-    private static String spyForChannel(final String channel)
-    {
-        return "aeron-spy:" + channel;
     }
 }

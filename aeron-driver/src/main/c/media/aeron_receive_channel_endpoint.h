@@ -55,6 +55,7 @@ typedef struct aeron_receive_channel_endpoint_stct
     aeron_counter_t channel_status;
     aeron_driver_receiver_proxy_t *receiver_proxy;
     int64_t receiver_id;
+    size_t so_rcvbuf;
     bool has_receiver_released;
 
     int64_t *short_sends_counter;
@@ -126,6 +127,21 @@ int aeron_receive_channel_endpoint_on_add_publication_image(
 int aeron_receive_channel_endpoint_on_remove_publication_image(
     aeron_receive_channel_endpoint_t *endpoint, aeron_publication_image_t *image);
 
+int aeron_receiver_channel_endpoint_validate_sender_mtu_length(
+    aeron_receive_channel_endpoint_t *endpoint, size_t sender_mtu_length, size_t window_max_length);
+
+inline int aeron_receive_channel_endpoint_on_remove_pending_setup(
+    aeron_receive_channel_endpoint_t *endpoint, int32_t session_id, int32_t stream_id)
+{
+    return aeron_data_packet_dispatcher_remove_pending_setup(&endpoint->dispatcher, session_id, stream_id);
+}
+
+inline int aeron_receive_channel_endpoint_on_remove_cooldown(
+    aeron_receive_channel_endpoint_t *endpoint, int32_t session_id, int32_t stream_id)
+{
+    return aeron_data_packet_dispatcher_remove_cooldown(&endpoint->dispatcher, session_id, stream_id);
+}
+
 inline void aeron_receive_channel_endpoint_receiver_release(aeron_receive_channel_endpoint_t *endpoint)
 {
     AERON_PUT_ORDERED(endpoint->has_receiver_released, true);
@@ -137,6 +153,11 @@ inline bool aeron_receive_channel_endpoint_has_receiver_released(aeron_receive_c
     AERON_GET_VOLATILE(has_receiver_released, endpoint->has_receiver_released);
 
     return has_receiver_released;
+}
+
+inline bool aeron_receive_channel_endpoint_should_elicit_setup_message(aeron_receive_channel_endpoint_t *endpoint)
+{
+    return aeron_data_packet_dispatcher_should_elicit_setup_message(&endpoint->dispatcher);
 }
 
 #endif //AERON_AERON_RECEIVE_CHANNEL_ENDPOINT_H

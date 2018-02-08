@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include <aeron_driver_receiver.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include "aeron_system_counters.h"
 #include "util/aeron_netutil.h"
 #include "util/aeron_error.h"
@@ -23,6 +23,7 @@
 #include "aeron_alloc.h"
 #include "collections/aeron_int64_to_ptr_hash_map.h"
 #include "media/aeron_receive_channel_endpoint.h"
+#include "aeron_driver_receiver.h"
 
 int aeron_receive_channel_endpoint_create(
     aeron_receive_channel_endpoint_t **endpoint,
@@ -76,6 +77,12 @@ int aeron_receive_channel_endpoint_create(
         return -1;
     }
 
+    if (aeron_udp_channel_transport_get_so_rcvbuf(&_endpoint->transport, &_endpoint->so_rcvbuf) < 0)
+    {
+        aeron_receive_channel_endpoint_delete(NULL, _endpoint);
+        return -1;
+    }
+
     _endpoint->transport.dispatch_clientd = _endpoint;
     _endpoint->has_receiver_released = false;
 
@@ -93,6 +100,13 @@ int aeron_receive_channel_endpoint_create(
     return 0;
 }
 
+void aeron_receive_channel_endpoint_free_stream_id_refcnt(void *clientd, int64_t key, void *value)
+{
+    aeron_stream_id_refcnt_t *count = value;
+
+    aeron_free(count);
+}
+
 int aeron_receive_channel_endpoint_delete(
     aeron_counters_manager_t *counters_manager, aeron_receive_channel_endpoint_t *endpoint)
 {
@@ -100,6 +114,8 @@ int aeron_receive_channel_endpoint_delete(
     {
         aeron_counters_manager_free(counters_manager, (int32_t)endpoint->channel_status.counter_id);
     }
+
+    aeron_int64_to_ptr_hash_map_for_each(&endpoint->stream_id_to_refcnt_map, aeron_receive_channel_endpoint_free_stream_id_refcnt, endpoint);
 
     aeron_int64_to_ptr_hash_map_delete(&endpoint->stream_id_to_refcnt_map);
     aeron_data_packet_dispatcher_close(&endpoint->dispatcher);
@@ -148,6 +164,7 @@ int aeron_receive_channel_endpoint_send_sm(
     msghdr.msg_name = addr;
     msghdr.msg_namelen = AERON_ADDR_LEN(addr);
     msghdr.msg_control = NULL;
+    msghdr.msg_controllen = 0;
 
     int bytes_sent;
     if ((bytes_sent = aeron_receive_channel_endpoint_sendmsg(endpoint, &msghdr)) != (int) iov[0].iov_len)
@@ -193,6 +210,7 @@ int aeron_receive_channel_endpoint_send_nak(
     msghdr.msg_name = addr;
     msghdr.msg_namelen = AERON_ADDR_LEN(addr);
     msghdr.msg_control = NULL;
+    msghdr.msg_controllen = 0;
 
     int bytes_sent;
     if ((bytes_sent = aeron_receive_channel_endpoint_sendmsg(endpoint, &msghdr)) != (int) iov[0].iov_len)
@@ -238,6 +256,7 @@ int aeron_receive_channel_endpoint_send_rttm(
     msghdr.msg_name = addr;
     msghdr.msg_namelen = AERON_ADDR_LEN(addr);
     msghdr.msg_control = NULL;
+    msghdr.msg_controllen = 0;
 
     int bytes_sent;
     if ((bytes_sent = aeron_receive_channel_endpoint_sendmsg(endpoint, &msghdr)) != (int) iov[0].iov_len)
@@ -435,6 +454,58 @@ int aeron_receive_channel_endpoint_on_remove_publication_image(
     return aeron_data_packet_dispatcher_remove_publication_image(&endpoint->dispatcher, image);
 }
 
+int aeron_receiver_channel_endpoint_validate_sender_mtu_length(
+    aeron_receive_channel_endpoint_t *endpoint, size_t sender_mtu_length, size_t window_max_length)
+{
+    if (sender_mtu_length < AERON_DATA_HEADER_LENGTH || sender_mtu_length > AERON_MAX_UDP_PAYLOAD_LENGTH)
+    {
+        aeron_set_err(
+            EINVAL,
+            "mtuLength must be a >= HEADER_LENGTH and <= MAX_UDP_PAYLOAD_LENGTH: mtuLength=%" PRIu64,
+            sender_mtu_length);
+        return -1;
+    }
+
+    if ((sender_mtu_length & (AERON_LOGBUFFER_FRAME_ALIGNMENT - 1)) != 0)
+    {
+        aeron_set_err(EINVAL, "mtuLength must be a multiple of FRAME_ALIGNMENT: mtuLength=%" PRIu64, sender_mtu_length);
+        return -1;
+    }
+
+    if (sender_mtu_length > window_max_length)
+    {
+        aeron_set_err(EINVAL, "Initial window length must be >= to mtuLength=%" PRIu64, sender_mtu_length);
+        return -1;
+    }
+
+    if (window_max_length > endpoint->so_rcvbuf)
+    {
+        aeron_set_err(
+            EINVAL,
+            "Max Window length greater than socket SO_RCVBUF, increase '"
+                AERON_RCV_INITIAL_WINDOW_LENGTH_ENV_VAR "' to match window: windowMaxLength=%" PRIu64 ", SO_RCVBUF=%" PRIu64,
+            window_max_length, endpoint->so_rcvbuf);
+        return -1;
+    }
+
+    if (sender_mtu_length > endpoint->so_rcvbuf)
+    {
+        aeron_set_err(
+            EINVAL,
+            "Sender MTU greater than socket SO_RCVBUF, increase '"
+                AERON_SOCKET_SO_RCVBUF_ENV_VAR "' to match MTU: senderMtuLength=%" PRIu64 ", SO_RCVBUF=%" PRIu64,
+            sender_mtu_length, endpoint->so_rcvbuf);
+        return -1;
+    }
+
+    return 0;
+}
+
+extern int aeron_receive_channel_endpoint_on_remove_pending_setup(
+    aeron_receive_channel_endpoint_t *endpoint, int32_t session_id, int32_t stream_id);
+extern int aeron_receive_channel_endpoint_on_remove_cooldown(
+    aeron_receive_channel_endpoint_t *endpoint, int32_t session_id, int32_t stream_id);
 extern size_t aeron_receive_channel_endpoint_stream_count(aeron_receive_channel_endpoint_t *endpoint);
 extern void aeron_receive_channel_endpoint_receiver_release(aeron_receive_channel_endpoint_t *endpoint);
 extern bool aeron_receive_channel_endpoint_has_receiver_released(aeron_receive_channel_endpoint_t *endpoint);
+extern bool aeron_receive_channel_endpoint_should_elicit_setup_message(aeron_receive_channel_endpoint_t *endpoint);

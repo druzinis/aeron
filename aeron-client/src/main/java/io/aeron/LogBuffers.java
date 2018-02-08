@@ -15,16 +15,21 @@
  */
 package io.aeron;
 
+import io.aeron.logbuffer.LogBufferDescriptor;
 import org.agrona.CloseHelper;
 import org.agrona.IoUtil;
+import org.agrona.ManagedResource;
 import org.agrona.concurrent.UnsafeBuffer;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Paths;
 
 import static io.aeron.logbuffer.LogBufferDescriptor.*;
+import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
 import static java.nio.file.StandardOpenOption.READ;
 import static java.nio.file.StandardOpenOption.WRITE;
 
@@ -33,81 +38,135 @@ import static java.nio.file.StandardOpenOption.WRITE;
  *
  * @see io.aeron.logbuffer.LogBufferDescriptor
  */
-public class LogBuffers implements AutoCloseable
+public class LogBuffers implements AutoCloseable, ManagedResource
 {
+    private long timeOfLastStateChangeNs;
+    private int refCount;
     private final int termLength;
     private final FileChannel fileChannel;
-    private final UnsafeBuffer[] termBuffers = new UnsafeBuffer[PARTITION_COUNT];
+    private final ByteBuffer[] termBuffers = new ByteBuffer[PARTITION_COUNT];
     private final UnsafeBuffer logMetaDataBuffer;
     private final MappedByteBuffer[] mappedByteBuffers;
 
-    public LogBuffers(final String logFileName, final FileChannel.MapMode mapMode)
+    /**
+     * Construct the log buffers for a given log file.
+     *
+     * @param logFileName to be mapped.
+     */
+    public LogBuffers(final String logFileName)
     {
         try
         {
             fileChannel = FileChannel.open(Paths.get(logFileName), READ, WRITE);
 
             final long logLength = fileChannel.size();
-            final int termLength = computeTermLength(logLength);
-
-            checkTermLength(termLength);
-            this.termLength = termLength;
 
             if (logLength < Integer.MAX_VALUE)
             {
-                final MappedByteBuffer mappedBuffer = fileChannel.map(mapMode, 0, logLength);
+                final MappedByteBuffer mappedBuffer = fileChannel.map(READ_WRITE, 0, logLength);
                 mappedByteBuffers = new MappedByteBuffer[]{ mappedBuffer };
+
+                logMetaDataBuffer = new UnsafeBuffer(
+                    mappedBuffer, (int)(logLength - LOG_META_DATA_LENGTH), LOG_META_DATA_LENGTH);
+
+                final int termLength = LogBufferDescriptor.termLength(logMetaDataBuffer);
+                final int pageSize = LogBufferDescriptor.pageSize(logMetaDataBuffer);
+
+                checkTermLength(termLength);
+                checkPageSize(pageSize);
+                this.termLength = termLength;
 
                 for (int i = 0; i < PARTITION_COUNT; i++)
                 {
                     final int offset = i * termLength;
                     mappedBuffer.limit(offset + termLength).position(offset);
 
-                    termBuffers[i] = new UnsafeBuffer(mappedBuffer.slice());
+                    termBuffers[i] = mappedBuffer.slice();
                 }
-
-                logMetaDataBuffer = new UnsafeBuffer(
-                    mappedBuffer, (int)(logLength - LOG_META_DATA_LENGTH), LOG_META_DATA_LENGTH);
             }
             else
             {
                 mappedByteBuffers = new MappedByteBuffer[PARTITION_COUNT + 1];
 
-                for (int i = 0; i < PARTITION_COUNT; i++)
-                {
-                    mappedByteBuffers[i] = fileChannel.map(mapMode, termLength * (long)i, termLength);
-                    termBuffers[i] = new UnsafeBuffer(mappedByteBuffers[i]);
-                }
+                final int assumedTermLength = TERM_MAX_LENGTH;
+
+                final long metaDataSectionOffset = assumedTermLength * (long)PARTITION_COUNT;
+                final long metaDataMappingLength = logLength - metaDataSectionOffset;
 
                 final MappedByteBuffer metaDataMappedBuffer = fileChannel.map(
-                    mapMode, logLength - LOG_META_DATA_LENGTH, LOG_META_DATA_LENGTH);
+                    READ_WRITE, metaDataSectionOffset, metaDataMappingLength);
+
                 mappedByteBuffers[mappedByteBuffers.length - 1] = metaDataMappedBuffer;
-                logMetaDataBuffer = new UnsafeBuffer(metaDataMappedBuffer);
+
+                logMetaDataBuffer = new UnsafeBuffer(
+                    metaDataMappedBuffer,
+                    (int)metaDataMappingLength - LOG_META_DATA_LENGTH,
+                    LOG_META_DATA_LENGTH);
+
+                final int metaDataTermLength = LogBufferDescriptor.termLength(logMetaDataBuffer);
+                final int pageSize = LogBufferDescriptor.pageSize(logMetaDataBuffer);
+
+                checkPageSize(pageSize);
+                if (metaDataTermLength != assumedTermLength)
+                {
+                    throw new IllegalStateException(
+                        "Assumed term length " + assumedTermLength +
+                        " does not match metadata: termLength=" + metaDataTermLength);
+                }
+
+                this.termLength = assumedTermLength;
+
+                for (int i = 0; i < PARTITION_COUNT; i++)
+                {
+                    final long position = assumedTermLength * (long)i;
+                    mappedByteBuffers[i] = fileChannel.map(READ_WRITE, position, assumedTermLength);
+                    termBuffers[i] = mappedByteBuffers[i];
+                }
             }
         }
         catch (final IOException ex)
         {
             throw new RuntimeException(ex);
         }
-
-        for (final UnsafeBuffer buffer : termBuffers)
+        catch (final IllegalStateException ex)
         {
-            buffer.verifyAlignment();
+            close();
+            throw ex;
+        }
+    }
+
+    /**
+     * Duplicate the underlying {@link ByteBuffer}s and wrap them for thread local access.
+     *
+     * @return duplicates of the wrapped underlying {@link ByteBuffer}s.
+     */
+    public UnsafeBuffer[] duplicateTermBuffers()
+    {
+        final UnsafeBuffer[] buffers = new UnsafeBuffer[PARTITION_COUNT];
+
+        for (int i = 0; i < PARTITION_COUNT; i++)
+        {
+            buffers[i] = new UnsafeBuffer(termBuffers[i].duplicate().order(ByteOrder.LITTLE_ENDIAN));
         }
 
-        logMetaDataBuffer.verifyAlignment();
+        return buffers;
     }
 
-    public UnsafeBuffer[] termBuffers()
-    {
-        return termBuffers;
-    }
-
+    /**
+     * Get the buffer which holds the log metadata.
+     *
+     * @return the buffer which holds the log metadata.
+     */
     public UnsafeBuffer metaDataBuffer()
     {
         return logMetaDataBuffer;
     }
 
+    /**
+     * The {@link FileChannel} for the mapped log.
+     *
+     * @return the {@link FileChannel} for the mapped log.
+     */
     public FileChannel fileChannel()
     {
         return fileChannel;
@@ -123,8 +182,38 @@ public class LogBuffers implements AutoCloseable
         CloseHelper.close(fileChannel);
     }
 
+    /**
+     * The length of the term buffer in each log partition.
+     *
+     * @return length of the term buffer in each log partition.
+     */
     public int termLength()
     {
         return termLength;
+    }
+
+    public int incRef()
+    {
+        return ++refCount;
+    }
+
+    public int decRef()
+    {
+        return --refCount;
+    }
+
+    public void timeOfLastStateChange(final long timeNs)
+    {
+        timeOfLastStateChangeNs = timeNs;
+    }
+
+    public long timeOfLastStateChange()
+    {
+        return timeOfLastStateChangeNs;
+    }
+
+    public void delete()
+    {
+        close();
     }
 }

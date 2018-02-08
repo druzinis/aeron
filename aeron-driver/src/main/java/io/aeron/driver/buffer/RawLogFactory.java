@@ -26,27 +26,32 @@ import java.nio.file.*;
 
 import static io.aeron.driver.Configuration.LOW_FILE_STORE_WARNING_THRESHOLD;
 import static io.aeron.driver.buffer.FileMappingConvention.streamLocation;
+import static io.aeron.logbuffer.LogBufferDescriptor.TERM_MAX_LENGTH;
 
 /**
  * Factory for creating {@link RawLog}s in the source publications or publication images directories as appropriate.
  */
 public class RawLogFactory
 {
-    private final DistinctErrorLog errorLog;
-    private final int maxTermBufferLength;
+    private final int filePageSize;
     private final boolean useSparseFiles;
+    private final boolean checkStorage;
+    private final DistinctErrorLog errorLog;
     private final File publicationsDir;
     private final File imagesDir;
     private final FileStore fileStore;
 
     public RawLogFactory(
         final String dataDirectoryName,
-        final int imagesTermBufferMaxLength,
+        final int filePageSize,
         final boolean useSparseFiles,
+        final boolean checkStorage,
         final DistinctErrorLog errorLog)
     {
-        this.errorLog = errorLog;
         this.useSparseFiles = useSparseFiles;
+        this.filePageSize = filePageSize;
+        this.checkStorage = checkStorage;
+        this.errorLog = errorLog;
 
         final FileMappingConvention fileMappingConvention = new FileMappingConvention(dataDirectoryName);
         publicationsDir = fileMappingConvention.publicationsDir();
@@ -58,7 +63,10 @@ public class RawLogFactory
         FileStore fs = null;
         try
         {
-            fs = Files.getFileStore(Paths.get(dataDirectoryName));
+            if (checkStorage)
+            {
+                fs = Files.getFileStore(Paths.get(dataDirectoryName));
+            }
         }
         catch (final IOException ex)
         {
@@ -66,7 +74,6 @@ public class RawLogFactory
         }
 
         fileStore = fs;
-        this.maxTermBufferLength = imagesTermBufferMaxLength;
     }
 
     /**
@@ -134,8 +141,20 @@ public class RawLogFactory
     {
         validateTermBufferLength(termBufferLength);
 
+        if (checkStorage)
+        {
+            checkStorage(termBufferLength);
+        }
+
+        final File location = streamLocation(rootDir, channel, sessionId, streamId, correlationId);
+
+        return new MappedRawLog(location, useSparseFiles, termBufferLength, filePageSize, errorLog);
+    }
+
+    private void checkStorage(final int termBufferLength)
+    {
         final long usableSpace = getUsableSpace();
-        final long logLength = LogBufferDescriptor.computeLogLength(termBufferLength);
+        final long logLength = LogBufferDescriptor.computeLogLength(termBufferLength, filePageSize);
 
         if (usableSpace <= LOW_FILE_STORE_WARNING_THRESHOLD)
         {
@@ -148,10 +167,6 @@ public class RawLogFactory
             throw new IllegalStateException(
                 "Insufficient usable storage for new log of length=" + logLength + " in " + fileStore);
         }
-
-        final File location = streamLocation(rootDir, channel, sessionId, streamId, correlationId);
-
-        return new MappedRawLog(location, useSparseFiles, termBufferLength, errorLog);
     }
 
     private long getUsableSpace()
@@ -172,10 +187,10 @@ public class RawLogFactory
 
     private void validateTermBufferLength(final int termBufferLength)
     {
-        if (termBufferLength < 0 || termBufferLength > maxTermBufferLength)
+        if (termBufferLength < 0 || termBufferLength > TERM_MAX_LENGTH)
         {
             throw new IllegalArgumentException(
-                "invalid buffer length: " + termBufferLength + " max is " + maxTermBufferLength);
+                "invalid buffer length: " + termBufferLength + " max is " + TERM_MAX_LENGTH);
         }
     }
 }

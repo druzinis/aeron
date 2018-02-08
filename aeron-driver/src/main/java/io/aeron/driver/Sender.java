@@ -37,7 +37,7 @@ class SenderLhsPadding
 
 class SenderHotFields extends SenderLhsPadding
 {
-    protected long controlPollTimeoutNs;
+    protected long controlPollDeadlineNs;
     protected int dutyCycleCounter;
     protected int roundRobinIndex = 0;
 }
@@ -61,6 +61,7 @@ public class Sender extends SenderRhsPadding implements Agent, Consumer<SenderCm
     private final OneToOneConcurrentArrayQueue<SenderCmd> commandQueue;
     private final AtomicCounter totalBytesSent;
     private final NanoClock nanoClock;
+    private final DriverConductorProxy conductorProxy;
 
     private NetworkPublication[] networkPublications = EMPTY_PUBLICATIONS;
 
@@ -69,9 +70,10 @@ public class Sender extends SenderRhsPadding implements Agent, Consumer<SenderCm
         this.controlTransportPoller = ctx.controlTransportPoller();
         this.commandQueue = ctx.senderCommandQueue();
         this.totalBytesSent = ctx.systemCounters().get(BYTES_SENT);
-        this.nanoClock = ctx.nanoClock();
-        this.statusMessageReadTimeoutNs = ctx.statusMessageTimeout() / 2;
+        this.nanoClock = ctx.cachedNanoClock();
+        this.statusMessageReadTimeoutNs = ctx.statusMessageTimeoutNs() / 2;
         this.dutyCycleRatio = Configuration.sendToStatusMessagePollRatio();
+        this.conductorProxy = ctx.driverConductorProxy();
     }
 
     public void onClose()
@@ -81,19 +83,19 @@ public class Sender extends SenderRhsPadding implements Agent, Consumer<SenderCm
 
     public int doWork()
     {
-        final int workCount = commandQueue.drain(this);
+        final int workCount = commandQueue.drain(this, Configuration.COMMAND_DRAIN_LIMIT);
 
         final long nowNs = nanoClock.nanoTime();
         final int bytesSent = doSend(nowNs);
 
         int bytesReceived = 0;
 
-        if (0 == bytesSent || ++dutyCycleCounter == dutyCycleRatio || nowNs >= controlPollTimeoutNs)
+        if (0 == bytesSent || ++dutyCycleCounter == dutyCycleRatio || nowNs >= controlPollDeadlineNs)
         {
             bytesReceived = controlTransportPoller.pollTransports();
 
             dutyCycleCounter = 0;
-            controlPollTimeoutNs = nowNs + statusMessageReadTimeoutNs;
+            controlPollDeadlineNs = nowNs + statusMessageReadTimeoutNs;
         }
 
         return workCount + bytesSent + bytesReceived;
@@ -106,7 +108,7 @@ public class Sender extends SenderRhsPadding implements Agent, Consumer<SenderCm
 
     public void onRegisterSendChannelEndpoint(final SendChannelEndpoint channelEndpoint)
     {
-        channelEndpoint.openChannel();
+        channelEndpoint.openChannel(conductorProxy);
         channelEndpoint.registerForRead(controlTransportPoller);
         channelEndpoint.indicateActive();
     }
@@ -166,7 +168,7 @@ public class Sender extends SenderRhsPadding implements Agent, Consumer<SenderCm
             bytesSent += publications[i].send(nowNs);
         }
 
-        totalBytesSent.addOrdered(bytesSent);
+        totalBytesSent.getAndAddOrdered(bytesSent);
 
         return bytesSent;
     }

@@ -17,6 +17,7 @@ package io.aeron.driver;
 
 import io.aeron.ReservedValueSupplier;
 import io.aeron.driver.status.SystemCounters;
+import org.junit.Before;
 import org.junit.experimental.theories.DataPoint;
 import org.junit.experimental.theories.Theories;
 import org.junit.experimental.theories.Theory;
@@ -69,11 +70,17 @@ public class RetransmitHandlerTest
     private final RetransmitSender retransmitSender = mock(RetransmitSender.class);
     private final SystemCounters systemCounters = mock(SystemCounters.class);
 
-    private final HeaderWriter headerWriter =
-        new HeaderWriter(DataHeaderFlyweight.createDefaultHeader(0, 0, 0));
+    private final HeaderWriter headerWriter = HeaderWriter.newInstance(
+        DataHeaderFlyweight.createDefaultHeader(0, 0, 0));
 
     private RetransmitHandler handler = new RetransmitHandler(
         () -> currentTime, systemCounters, DELAY_GENERATOR, LINGER_GENERATOR);
+
+    @Before
+    public void before()
+    {
+        LogBufferDescriptor.rawTail(metaDataBuffer, 0, LogBufferDescriptor.packTail(TERM_ID, 0));
+    }
 
     @DataPoint
     public static final BiConsumer<RetransmitHandlerTest, Integer> SENDER_ADD_DATA_FRAME =
@@ -238,7 +245,8 @@ public class RetransmitHandlerTest
     private void addSentDataFrame()
     {
         rcvBuffer.putBytes(0, DATA);
-        termAppender.appendUnfragmentedMessage(headerWriter, rcvBuffer, 0, DATA.length, RESERVED_VALUE_SUPPLIER);
+        termAppender.appendUnfragmentedMessage(
+            headerWriter, rcvBuffer, 0, DATA.length, RESERVED_VALUE_SUPPLIER, TERM_ID);
     }
 
     private void addReceivedDataFrame(final int msgNum)

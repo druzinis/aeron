@@ -16,6 +16,7 @@
 package io.aeron;
 
 import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import org.junit.Test;
 import org.junit.experimental.theories.DataPoint;
 import org.junit.experimental.theories.Theories;
@@ -50,16 +51,18 @@ public class BufferClaimMessageTest
 
     @Theory
     @Test(timeout = 10000)
-    public void shouldReceivePublishedMessageWithInterleavedAbort(final String channel) throws Exception
+    public void shouldReceivePublishedMessageWithInterleavedAbort(final String channel)
     {
         final BufferClaim bufferClaim = new BufferClaim();
-        final UnsafeBuffer srcBuffer = new UnsafeBuffer(ByteBuffer.allocateDirect(MESSAGE_LENGTH));
-        final MediaDriver.Context ctx = new MediaDriver.Context();
+        final UnsafeBuffer srcBuffer = new UnsafeBuffer(ByteBuffer.allocate(MESSAGE_LENGTH));
+        final MediaDriver.Context ctx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
+            .threadingMode(ThreadingMode.SHARED);
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(channel, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(channel, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(channel, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(channel, STREAM_ID))
         {
             publishMessage(srcBuffer, publication);
 
@@ -76,7 +79,13 @@ public class BufferClaimMessageTest
             int numFragments = 0;
             do
             {
-                numFragments += subscription.poll(mockFragmentHandler, FRAGMENT_COUNT_LIMIT);
+                final int fragments = subscription.poll(mockFragmentHandler, FRAGMENT_COUNT_LIMIT);
+                if (0 == fragments)
+                {
+                    Thread.yield();
+                }
+
+                numFragments += fragments;
             }
             while (numFragments < expectedNumberOfFragments);
 
@@ -91,15 +100,15 @@ public class BufferClaimMessageTest
 
     @Theory
     @Test(timeout = 10000)
-    public void shouldTransferReservedValue(final String channel) throws Exception
+    public void shouldTransferReservedValue(final String channel)
     {
         final BufferClaim bufferClaim = new BufferClaim();
         final MediaDriver.Context ctx = new MediaDriver.Context();
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(channel, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(channel, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(channel, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(channel, STREAM_ID))
         {
             while (publication.tryClaim(MESSAGE_LENGTH, bufferClaim) < 0L)
             {

@@ -53,6 +53,7 @@ public class GapFillLossTest
         srcBuffer.setMemory(0, MSG_LENGTH, (byte)7);
 
         final MediaDriver.Context ctx = new MediaDriver.Context()
+            .errorHandler(Throwable::printStackTrace)
             .threadingMode(ThreadingMode.SHARED)
             .publicationTermBufferLength(TERM_BUFFER_LENGTH);
 
@@ -64,18 +65,17 @@ public class GapFillLossTest
         final LossGenerator noLossGenerator =
             DebugChannelEndpointConfiguration.lossGeneratorSupplier(0, 0);
 
-        ctx.sendChannelEndpointSupplier(
-            (udpChannel, statusIndicator, context) -> new DebugSendChannelEndpoint(
-                udpChannel, statusIndicator, context, noLossGenerator, noLossGenerator));
+        ctx.sendChannelEndpointSupplier((udpChannel, statusIndicator, context) -> new DebugSendChannelEndpoint(
+            udpChannel, statusIndicator, context, noLossGenerator, noLossGenerator));
 
         ctx.receiveChannelEndpointSupplier(
             (udpChannel, dispatcher, statusIndicator, context) -> new DebugReceiveChannelEndpoint(
-                udpChannel, dispatcher, statusIndicator, context, dataLossGenerator, noLossGenerator));
+            udpChannel, dispatcher, statusIndicator, context, dataLossGenerator, noLossGenerator));
 
         try (MediaDriver ignore = MediaDriver.launch(ctx);
-             Aeron aeron = Aeron.connect();
-             Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
-             Subscription subscription = aeron.addSubscription(UNRELIABLE_CHANNEL, STREAM_ID))
+            Aeron aeron = Aeron.connect();
+            Publication publication = aeron.addPublication(CHANNEL, STREAM_ID);
+            Subscription subscription = aeron.addSubscription(UNRELIABLE_CHANNEL, STREAM_ID))
         {
             final IdleStrategy idleStrategy = new YieldingIdleStrategy();
 
@@ -120,12 +120,12 @@ public class GapFillLossTest
         {
             final IdleStrategy idleStrategy = new YieldingIdleStrategy();
 
-            while (subscription.hasNoImages())
+            while (!subscription.isConnected())
             {
                 idleStrategy.idle();
             }
 
-            final Image image = subscription.getImage(0);
+            final Image image = subscription.imageAtIndex(0);
 
             while (image.position() < FINAL_POSITION.get())
             {

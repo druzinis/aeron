@@ -23,6 +23,7 @@ SET(SOURCE
     ClientConductor.cpp
     Aeron.cpp
     LogBuffers.cpp
+    Counter.cpp
     util/MemoryMappedFile.cpp
     util/CommandOption.cpp
     util/CommandOptionParser.cpp)
@@ -42,6 +43,7 @@ SET(HEADERS
     FragmentAssembler.h
     ControlledFragmentAssembler.h
     ExclusivePublication.h
+    Counter.h
     command/ImageMessageFlyweight.h
     command/ImageBuffersReadyFlyweight.h
     command/ControlProtocolEvents.h
@@ -53,7 +55,12 @@ SET(HEADERS
     command/RemoveMessageFlyweight.h
     command/SubscriptionMessageFlyweight.h
     command/DestinationMessageFlyweight.h
+    command/SubscriptionReadyFlyweight.h
+    command/OperationSucceededFlyweight.h
+    command/CounterMessageFlyweight.h
+    command/CounterUpdateFlyweight.h
     concurrent/AgentRunner.h
+    concurrent/AgentInvoker.h
     concurrent/Atomic64.h
     concurrent/AtomicBuffer.h
     concurrent/AtomicCounter.h
@@ -93,6 +100,7 @@ SET(HEADERS
     concurrent/status/ReadablePosition.h
     concurrent/status/Position.h
     concurrent/status/UnsafeBufferPosition.h
+    concurrent/status/StatusIndicatorReader.h
     protocol/HeaderFlyweight.h
     protocol/NakFlyweight.h
     protocol/StatusMessageFlyweight.h

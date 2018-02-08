@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 - 2017 Real Logic Ltd.
+ * Copyright 2014 - 2018 Real Logic Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+#if defined(__linux__)
+#define _BSD_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <stddef.h>
 #include <string.h>
@@ -27,7 +30,11 @@
 #include <errno.h>
 #include <math.h>
 #include <limits.h>
+
+#ifdef HAVE_UUID_H
 #include <uuid/uuid.h>
+#endif
+
 #include "util/aeron_error.h"
 #include "protocol/aeron_udp_protocol.h"
 #include "util/aeron_fileutil.h"
@@ -36,6 +43,7 @@
 #include "concurrent/aeron_mpsc_rb.h"
 #include "concurrent/aeron_broadcast_transmitter.h"
 #include "aeron_agent.h"
+#include "concurrent/aeron_counters_manager.h"
 
 inline static const char *tmp_dir()
 {
@@ -63,7 +71,7 @@ inline static const char *tmp_dir()
 inline static bool has_file_separator_at_end(const char *path)
 {
 #if defined(_MSC_VER)
-    return path[strlen(path) - 1] == '\';
+    return path[strlen(path) - 1] == '\\';
 #else
     return path[strlen(path) - 1] == '/';
 #endif
@@ -129,6 +137,8 @@ uint64_t aeron_config_parse_uint64(const char *str, uint64_t def, uint64_t min, 
     return result;
 }
 
+#define AERON_CONFIG_GETENV_OR_DEFAULT(e,d) ((NULL == getenv(e)) ? (d) : getenv(e))
+
 static void aeron_driver_conductor_to_driver_interceptor_null(
     int32_t msg_type_id, const void *message, size_t length, void *clientd)
 {
@@ -182,6 +192,9 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         return -1;
     }
 
+    _context->agent_on_start_func = NULL;
+    _context->agent_on_start_state = NULL;
+
     if ((_context->unicast_flow_control_supplier_func =
         aeron_flow_control_strategy_supplier_load("aeron_unicast_flow_control_strategy_supplier")) == NULL)
     {
@@ -202,8 +215,8 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
 
 #if defined(__linux__)
     snprintf(_context->aeron_dir, AERON_MAX_PATH - 1, "/dev/shm/aeron-%s", username());
-#elif (_MSC_VER)
-    snprintf(_context->aeron_dir, AERON_MAX_PATH - 1, "%s%saeron-%s", tmp_dir(), has_file_separator_at_end(tmp_dir()) ? "" : "\", username());
+#elif defined(_MSC_VER)
+    snprintf(_context->aeron_dir, AERON_MAX_PATH - 1, "%s%saeron-%s", tmp_dir(), has_file_separator_at_end(tmp_dir()) ? "" : "\\", username());
 #else
     snprintf(_context->aeron_dir, AERON_MAX_PATH - 1, "%s%saeron-%s", tmp_dir(), has_file_separator_at_end(tmp_dir()) ? "" : "/", username());
 #endif
@@ -211,16 +224,23 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     _context->threading_mode = AERON_THREADING_MODE_DEDICATED;
     _context->dirs_delete_on_start = false;
     _context->warn_if_dirs_exist = true;
+    _context->term_buffer_sparse_file = false;
+    _context->perform_storage_checks = true;
+    _context->spies_simulate_connection = false;
     _context->driver_timeout_ms = 10 * 1000;
     _context->to_driver_buffer_length = 1024 * 1024 + AERON_RB_TRAILER_LENGTH;
     _context->to_clients_buffer_length = 1024 * 1024 + AERON_BROADCAST_BUFFER_TRAILER_LENGTH;
     _context->counters_values_buffer_length = 1024 * 1024;
-    _context->counters_metadata_buffer_length = _context->counters_values_buffer_length * 2;
+    _context->counters_metadata_buffer_length =
+        _context->counters_values_buffer_length *
+        (AERON_COUNTERS_MANAGER_METADATA_LENGTH / AERON_COUNTERS_MANAGER_VALUE_LENGTH);
     _context->error_buffer_length = 1024 * 1024;
     _context->client_liveness_timeout_ns = 5 * 1000 * 1000 * 1000L;
+    _context->timer_interval_ns = 1 * 1000 * 1000 * 1000L;
     _context->term_buffer_length = 16 * 1024 * 1024;
     _context->ipc_term_buffer_length = 64 * 1024 * 1024;
-    _context->mtu_length = 4096;
+    _context->mtu_length = 1408;
+    _context->ipc_mtu_length = 1408;
     _context->ipc_publication_window_length = 0;
     _context->publication_window_length = 0;
     _context->publication_linger_timeout_ns = 5 * 1000 * 1000 * 1000L;
@@ -232,6 +252,10 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     _context->image_liveness_timeout_ns = 10 * 1000 * 1000 * 1000L;
     _context->initial_window_length = 128 * 1024;
     _context->loss_report_length = 1024 * 1024;
+    _context->file_page_size = 4 * 1024;
+    _context->publication_unblock_timeout_ns = 10 * 1000 * 1000 * 1000L;
+    _context->publication_connection_timeout_ns = 5 * 1000 * 1000 * 1000L;
+    _context->counter_free_to_reuse_ns = 1 * 1000 * 1000 * 1000L;
 
     /* set from env */
     char *value = NULL;
@@ -239,6 +263,14 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     if ((value = getenv(AERON_DIR_ENV_VAR)))
     {
         snprintf(_context->aeron_dir, AERON_MAX_PATH - 1, "%s", value);
+    }
+
+    if ((value = getenv(AERON_AGENT_ON_START_FUNCTION_ENV_VAR)))
+    {
+        if ((_context->agent_on_start_func = aeron_agent_on_start_load(value)) == NULL)
+        {
+            return -1;
+        }
     }
 
     if ((value = getenv(AERON_UNICAST_FLOWCONTROL_SUPPLIER_ENV_VAR)))
@@ -291,6 +323,16 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
             getenv(AERON_TERM_BUFFER_SPARSE_FILE_ENV_VAR),
             _context->term_buffer_sparse_file);
 
+    _context->perform_storage_checks =
+        aeron_config_parse_bool(
+            getenv(AERON_PERFORM_STORAGE_CHECKS_ENV_VAR),
+            _context->perform_storage_checks);
+
+    _context->spies_simulate_connection =
+        aeron_config_parse_bool(
+            getenv(AERON_SPIES_SIMULATE_CONNECTION_ENV_VAR),
+            _context->spies_simulate_connection);
+
     _context->to_driver_buffer_length =
         aeron_config_parse_uint64(
             getenv(AERON_TO_CONDUCTOR_BUFFER_LENGTH_ENV_VAR),
@@ -312,7 +354,9 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
             1024,
             INT32_MAX);
 
-    _context->counters_metadata_buffer_length = _context->counters_values_buffer_length * 2;
+    _context->counters_metadata_buffer_length =
+        _context->counters_values_buffer_length *
+        (AERON_COUNTERS_MANAGER_METADATA_LENGTH / AERON_COUNTERS_MANAGER_VALUE_LENGTH);
 
     _context->error_buffer_length =
         aeron_config_parse_uint64(
@@ -353,6 +397,13 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         aeron_config_parse_uint64(
             getenv(AERON_MTU_LENGTH_ENV_VAR),
             _context->mtu_length,
+            AERON_DATA_HEADER_LENGTH,
+            AERON_MAX_UDP_PAYLOAD_LENGTH);
+
+    _context->ipc_mtu_length =
+        aeron_config_parse_uint64(
+            getenv(AERON_IPC_MTU_LENGTH_ENV_VAR),
+            _context->ipc_mtu_length,
             AERON_DATA_HEADER_LENGTH,
             AERON_MAX_UDP_PAYLOAD_LENGTH);
 
@@ -426,6 +477,41 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
             1024,
             INT32_MAX);
 
+    _context->file_page_size =
+        aeron_config_parse_uint64(
+            getenv(AERON_FILE_PAGE_SIZE_ENV_VAR),
+            _context->file_page_size,
+            4 * 1024,
+            INT32_MAX);
+
+    _context->publication_unblock_timeout_ns =
+        aeron_config_parse_uint64(
+            getenv(AERON_PUBLICATION_UNBLOCK_TIMEOUT_ENV_VAR),
+            _context->publication_unblock_timeout_ns,
+            1000,
+            INT64_MAX);
+
+    _context->publication_connection_timeout_ns =
+        aeron_config_parse_uint64(
+            getenv(AERON_PUBLICATION_CONNECTION_TIMEOUT_ENV_VAR),
+            _context->publication_connection_timeout_ns,
+            1000,
+            INT64_MAX);
+
+    _context->timer_interval_ns =
+        aeron_config_parse_uint64(
+            getenv(AERON_TIMER_INTERVAL_ENV_VAR),
+            _context->timer_interval_ns,
+            1000,
+            INT64_MAX);
+
+    _context->counter_free_to_reuse_ns =
+        aeron_config_parse_uint64(
+            getenv(AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT_ENV_VAR),
+            _context->counter_free_to_reuse_ns,
+            0,
+            INT64_MAX);
+
     _context->to_driver_buffer = NULL;
     _context->to_clients_buffer = NULL;
     _context->counters_values_buffer = NULL;
@@ -436,23 +522,39 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
     _context->epoch_clock = aeron_epochclock;
 
     _context->conductor_idle_strategy_func =
-        aeron_idle_strategy_load("yielding", &_context->conductor_idle_strategy_state);
-    _context->shared_idle_strategy_func =
-        aeron_idle_strategy_load("yielding", &_context->shared_idle_strategy_state);
-    _context->shared_network_idle_strategy_func =
-        aeron_idle_strategy_load("yielding", &_context->shared_network_idle_strategy_state);
-    _context->sender_idle_strategy_func =
-        aeron_idle_strategy_load("noop", &_context->sender_idle_strategy_state);
-    _context->receiver_idle_strategy_func =
-        aeron_idle_strategy_load("noop", &_context->receiver_idle_strategy_state);
+        aeron_idle_strategy_load(
+            AERON_CONFIG_GETENV_OR_DEFAULT(AERON_CONDUCTOR_IDLE_STRATEGY_ENV_VAR, "yielding"),
+            &_context->conductor_idle_strategy_state);
 
-    _context->usable_fs_space_func = aeron_usable_fs_space;
+    _context->shared_idle_strategy_func =
+        aeron_idle_strategy_load(
+            AERON_CONFIG_GETENV_OR_DEFAULT(AERON_SHARED_IDLE_STRATEGY_ENV_VAR, "yielding"),
+            &_context->shared_idle_strategy_state);
+
+    _context->shared_network_idle_strategy_func =
+        aeron_idle_strategy_load(
+            AERON_CONFIG_GETENV_OR_DEFAULT(AERON_SHAREDNETWORK_IDLE_STRATEGY_ENV_VAR, "yielding"),
+            &_context->shared_network_idle_strategy_state);
+
+    _context->sender_idle_strategy_func =
+        aeron_idle_strategy_load(
+            AERON_CONFIG_GETENV_OR_DEFAULT(AERON_SENDER_IDLE_STRATEGY_ENV_VAR, "noop"),
+            &_context->sender_idle_strategy_state);
+
+    _context->receiver_idle_strategy_func =
+        aeron_idle_strategy_load(
+            AERON_CONFIG_GETENV_OR_DEFAULT(AERON_RECEIVER_IDLE_STRATEGY_ENV_VAR, "noop"),
+            &_context->receiver_idle_strategy_state);
+
+    _context->usable_fs_space_func =
+        _context->perform_storage_checks ? aeron_usable_fs_space : aeron_usable_fs_space_disabled;
     _context->map_raw_log_func = aeron_map_raw_log;
     _context->map_raw_log_close_func = aeron_map_raw_log_close;
 
     _context->to_driver_interceptor_func = aeron_driver_conductor_to_driver_interceptor_null;
     _context->to_client_interceptor_func = aeron_driver_conductor_to_client_interceptor_null;
 
+#ifdef HAVE_UUID_GENERATE
     uuid_t id;
     uuid_generate(id);
 
@@ -462,8 +564,11 @@ int aeron_driver_context_init(aeron_driver_context_t **context)
         uint64_t low;
     }
     *id_as_uint64 = (struct uuid_as_uint64 *)&id;
-
     _context->receiver_id = id_as_uint64->high ^ id_as_uint64->low;
+#else
+    /* pure random id */
+    _context->receiver_id = aeron_randomised_int32();
+#endif
 
     *context = _context;
     return 0;
@@ -492,6 +597,26 @@ int aeron_driver_context_close(aeron_driver_context_t *context)
     return 0;
 }
 
+int aeron_driver_context_validate_mtu_length(uint64_t mtu_length)
+{
+    if (mtu_length < AERON_DATA_HEADER_LENGTH || mtu_length > AERON_MAX_UDP_PAYLOAD_LENGTH)
+    {
+        aeron_set_err(
+            EINVAL,
+            "mtuLength must be a >= HEADER_LENGTH and <= MAX_UDP_PAYLOAD_LENGTH: mtuLength=%" PRIu64,
+            mtu_length);
+        return -1;
+    }
+
+    if ((mtu_length & (AERON_LOGBUFFER_FRAME_ALIGNMENT - 1)) != 0)
+    {
+        aeron_set_err(EINVAL, "mtuLength must be a multiple of FRAME_ALIGNMENT: mtuLength=%" PRIu64, mtu_length);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int unlink_func(const char *path, const struct stat *sb, int type_flag, struct FTW *ftw)
 {
     if (remove(path) != 0)
@@ -513,14 +638,22 @@ bool aeron_is_driver_active_with_cnc(
 {
     char buffer[AERON_MAX_PATH];
     aeron_cnc_metadata_t *metadata = (aeron_cnc_metadata_t *)cnc_mmap->addr;
+    int32_t cnc_version;
 
-    if (AERON_CNC_VERSION != metadata->cnc_version)
+    while (0 == (cnc_version = aeron_cnc_version_volatile(metadata)))
     {
-        snprintf(
-            buffer,
-            sizeof(buffer) - 1,
-            "ERROR: aeron cnc file version not understood: version=%d",
-            metadata->cnc_version);
+        if (aeron_epochclock() > (now + timeout))
+        {
+            snprintf(buffer, sizeof(buffer) - 1, "ERROR: aeron cnc file version 0 for timeout");
+            return false;
+        }
+
+        usleep(1000);
+    }
+
+    if (AERON_CNC_VERSION != cnc_version)
+    {
+        snprintf(buffer, sizeof(buffer) - 1, "ERROR: aeron cnc file version not understood: version=%d", cnc_version);
         log_func(buffer);
     }
     else
@@ -530,8 +663,7 @@ bool aeron_is_driver_active_with_cnc(
         if (aeron_mpsc_rb_init(
             &rb, aeron_cnc_to_driver_buffer(metadata), (size_t)metadata->to_driver_buffer_length) != 0)
         {
-            snprintf(
-                buffer, sizeof(buffer) - 1, "ERROR: aeron cnc file could not init to-driver buffer");
+            snprintf(buffer, sizeof(buffer) - 1, "ERROR: aeron cnc file could not init to-driver buffer");
             log_func(buffer);
         }
         else
@@ -540,8 +672,7 @@ bool aeron_is_driver_active_with_cnc(
 
             int64_t diff = now - timestamp;
 
-            snprintf(
-                buffer, sizeof(buffer) - 1, "INFO: Aeron toDriver consumer heartbeat is %" PRId64 " ms old", diff);
+            snprintf(buffer, sizeof(buffer) - 1, "INFO: Aeron toDriver consumer heartbeat is %" PRId64 " ms old", diff);
             log_func(buffer);
 
             if (diff <= timeout)
@@ -586,29 +717,15 @@ bool aeron_is_driver_active(const char *dirname, int64_t timeout, int64_t now, a
     return result;
 }
 
+extern int32_t aeron_cnc_version_volatile(aeron_cnc_metadata_t *metadata);
+extern void aeron_cnc_version_signal_cnc_ready(aeron_cnc_metadata_t *metadata, int32_t cnc_version);
 extern uint8_t *aeron_cnc_to_driver_buffer(aeron_cnc_metadata_t *metadata);
 extern uint8_t *aeron_cnc_to_clients_buffer(aeron_cnc_metadata_t *metadata);
 extern uint8_t *aeron_cnc_counters_metadata_buffer(aeron_cnc_metadata_t *metadata);
 extern uint8_t *aeron_cnc_counters_values_buffer(aeron_cnc_metadata_t *metadata);
 extern uint8_t *aeron_cnc_error_log_buffer(aeron_cnc_metadata_t *metadata);
-extern size_t aeron_cnc_computed_length(size_t total_length_of_buffers);
+extern size_t aeron_cnc_computed_length(size_t total_length_of_buffers, size_t alignment);
 extern size_t aeron_cnc_length(aeron_driver_context_t *context);
 
 extern size_t aeron_ipc_publication_term_window_length(aeron_driver_context_t *context, size_t term_length);
 extern size_t aeron_network_publication_term_window_length(aeron_driver_context_t *context, size_t term_length);
-
-int aeron_driver_context_set(aeron_driver_context_t *context, const char *setting, const char *value)
-{
-    if (NULL == setting || NULL == value)
-    {
-        errno = EINVAL;
-        aeron_set_err(EINVAL, "aeron_driver_context_set: %s", strerror(EINVAL));
-        return -1;
-    }
-
-    /* TODO: */
-
-    errno = ENOTSUP;
-    aeron_set_err(ENOTSUP, "aeron_driver_context_set: %s", strerror(ENOTSUP));
-    return -1;
-}

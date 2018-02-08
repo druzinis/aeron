@@ -21,10 +21,11 @@ import org.agrona.BitUtil;
 import org.agrona.BufferUtil;
 import org.agrona.concurrent.UnsafeBuffer;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * A very simple Aeron publisher application
- * Publishes a fixed size message on a fixed channel and stream. Upon completion
- * of message send, it lingers for 5 seconds before exiting.
+ * Publishes a fixed size message on a fixed channel and stream.
  */
 public class SimplePublisher
 {
@@ -51,11 +52,24 @@ public class SimplePublisher
         // media driver, and create a Publication.  The Aeron and Publication classes implement
         // AutoCloseable, and will automatically clean up resources when this try block is finished.
         try (Aeron aeron = Aeron.connect(ctx);
-             Publication publication = aeron.addPublication(channel, streamId))
+            Publication publication = aeron.addPublication(channel, streamId))
         {
             final String message = "Hello World! ";
             final byte[] messageBytes = message.getBytes();
             buffer.putBytes(0, messageBytes);
+
+            // Wait for 5 seconds to connect to a subscriber
+            final long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!publication.isConnected())
+            {
+                if (System.nanoTime() >= deadlineNs)
+                {
+                    System.out.println("Failed to connect to subscriber");
+                    return;
+                }
+
+                Thread.sleep(1);
+            }
 
             // Try to publish the buffer. 'offer' is a non-blocking call.
             // If it returns less than 0, the message was not sent, and the offer should be retried.
@@ -78,6 +92,10 @@ public class SimplePublisher
                 else if (result == Publication.CLOSED)
                 {
                     System.out.println("Offer failed publication is closed");
+                }
+                else if (result == Publication.MAX_POSITION_EXCEEDED)
+                {
+                    System.out.println("Offer failed due to publication reaching max position");
                 }
                 else
                 {

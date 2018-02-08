@@ -23,24 +23,29 @@ ExclusivePublication::ExclusivePublication(
     ClientConductor &conductor,
     const std::string &channel,
     std::int64_t registrationId,
-    std::int64_t correlationId,
+    std::int64_t originalRegistrationId,
     std::int32_t streamId,
     std::int32_t sessionId,
     UnsafeBufferPosition& publicationLimit,
+    StatusIndicatorReader& channelStatusIndicator,
     std::shared_ptr<LogBuffers> buffers)
     :
     m_conductor(conductor),
     m_logMetaDataBuffer(buffers->atomicBuffer(LogBufferDescriptor::LOG_META_DATA_SECTION_INDEX)),
     m_channel(channel),
     m_registrationId(registrationId),
+    m_originalRegistrationId(originalRegistrationId),
+    m_maxPossiblePosition(static_cast<int64_t>(buffers->atomicBuffer(0).capacity()) << 31),
     m_streamId(streamId),
     m_sessionId(sessionId),
     m_initialTermId(LogBufferDescriptor::initialTermId(m_logMetaDataBuffer)),
     m_maxPayloadLength(LogBufferDescriptor::mtuLength(m_logMetaDataBuffer) - DataFrameHeader::LENGTH),
-    m_maxMessageLength(FrameDescriptor::computeMaxMessageLength(buffers->atomicBuffer(0).capacity())),
+    m_maxMessageLength(FrameDescriptor::computeExclusiveMaxMessageLength(buffers->atomicBuffer(0).capacity())),
     m_positionBitsToShift(util::BitUtil::numberOfTrailingZeroes(buffers->atomicBuffer(0).capacity())),
-    m_activePartitionIndex(LogBufferDescriptor::activePartitionIndex(m_logMetaDataBuffer)),
+    m_activePartitionIndex(
+        LogBufferDescriptor::indexByTermCount(LogBufferDescriptor::activeTermCount(m_logMetaDataBuffer))),
     m_publicationLimit(publicationLimit),
+    m_channelStatusIndicator(channelStatusIndicator),
     m_logbuffers(buffers),
     m_headerWriter(LogBufferDescriptor::defaultFrameHeader(m_logMetaDataBuffer))
 {
@@ -69,18 +74,23 @@ ExclusivePublication::~ExclusivePublication()
     m_conductor.releaseExclusivePublication(m_registrationId);
 }
 
-bool ExclusivePublication::isPublicationConnected(std::int64_t timeOfLastStatusMessage) const
-{
-    return m_conductor.isPublicationConnected(timeOfLastStatusMessage);
-}
-
 void ExclusivePublication::addDestination(const std::string& endpointChannel)
 {
+    if (isClosed())
+    {
+        throw util::IllegalStateException(std::string("Publication is closed"), SOURCEINFO);
+    }
+
     m_conductor.addDestination(m_registrationId, endpointChannel);
 }
 
 void ExclusivePublication::removeDestination(const std::string& endpointChannel)
 {
+    if (isClosed())
+    {
+        throw util::IllegalStateException(std::string("Publication is closed"), SOURCEINFO);
+    }
+
     m_conductor.removeDestination(m_registrationId, endpointChannel);
 }
 

@@ -52,7 +52,7 @@ public class DataPacketDispatcherTest
     private final ReceiveChannelEndpoint mockChannelEndpoint = mock(ReceiveChannelEndpoint.class);
 
     @Before
-    public void setUp() throws Exception
+    public void setUp()
     {
         when(mockHeader.sessionId()).thenReturn(SESSION_ID);
         when(mockHeader.streamId()).thenReturn(STREAM_ID);
@@ -206,7 +206,7 @@ public class DataPacketDispatcherTest
         dispatcher.addPublicationImage(mockImage);
         dispatcher.onDataPacket(mockChannelEndpoint, mockHeader, mockBuffer, LENGTH, SRC_ADDRESS);
 
-        verify(mockImage).status(PublicationImage.Status.ACTIVE);
+        verify(mockImage).activate();
         verify(mockImage).insertPacket(ACTIVE_TERM_ID, TERM_OFFSET, mockBuffer, LENGTH);
     }
 

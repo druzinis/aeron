@@ -17,6 +17,7 @@
 #include <string.h>
 #include "util/aeron_error.h"
 #include "aeron_publication_image.h"
+#include "aeron_driver_receiver.h"
 
 int aeron_data_packet_dispatcher_init(
     aeron_data_packet_dispatcher_t *dispatcher,
@@ -46,8 +47,17 @@ int aeron_data_packet_dispatcher_init(
     return 0;
 }
 
+void aeron_data_packet_dispatcher_delete_session_maps(void *clientd, int64_t key, void *value)
+{
+    aeron_int64_to_ptr_hash_map_t *session_map = value;
+
+    aeron_int64_to_ptr_hash_map_delete(session_map);
+    aeron_free(session_map);
+}
+
 int aeron_data_packet_dispatcher_close(aeron_data_packet_dispatcher_t *dispatcher)
 {
+    aeron_int64_to_ptr_hash_map_for_each(&dispatcher->session_by_stream_id_map, aeron_data_packet_dispatcher_delete_session_maps, dispatcher);
     aeron_int64_to_ptr_hash_map_delete(&dispatcher->ignored_sessions_map);
     aeron_int64_to_ptr_hash_map_delete(&dispatcher->session_by_stream_id_map);
 
@@ -166,7 +176,8 @@ int aeron_data_packet_dispatcher_on_data(
         }
         else if (NULL == aeron_int64_to_ptr_hash_map_get(
             &dispatcher->ignored_sessions_map,
-            aeron_int64_to_ptr_hash_map_compound_key(header->session_id, header->stream_id)))
+            aeron_int64_to_ptr_hash_map_compound_key(header->session_id, header->stream_id)) &&
+            (((aeron_frame_header_t *)buffer)->flags & AERON_DATA_HEADER_EOS_FLAG) == 0)
         {
             return aeron_data_packet_dispatcher_elicit_setup_from_source(
                 dispatcher, endpoint, addr, header->stream_id, header->session_id);
@@ -295,9 +306,13 @@ int aeron_data_packet_dispatcher_elicit_setup_from_source(
         return -1;
     }
 
-    /* TODO: receiver add pending setup message so it can time it out */
-    return 0;
+    return aeron_driver_receiver_add_pending_setup(dispatcher->receiver, endpoint, session_id, stream_id, NULL);
 }
 
 extern bool aeron_data_packet_dispatcher_is_not_already_in_progress_or_on_cooldown(
     aeron_data_packet_dispatcher_t *dispatcher, int32_t stream_id, int32_t session_id);
+extern int aeron_data_packet_dispatcher_remove_pending_setup(
+    aeron_data_packet_dispatcher_t *dispatcher, int32_t session_id, int32_t stream_id);
+extern int aeron_data_packet_dispatcher_remove_cooldown(
+    aeron_data_packet_dispatcher_t *dispatcher, int32_t session_id, int32_t stream_id);
+extern bool aeron_data_packet_dispatcher_should_elicit_setup_message(aeron_data_packet_dispatcher_t *dispatcher);

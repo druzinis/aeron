@@ -16,6 +16,8 @@
 package io.aeron;
 
 import io.aeron.exceptions.DriverTimeoutException;
+import io.aeron.logbuffer.FragmentHandler;
+import org.agrona.DirectBuffer;
 import org.agrona.ErrorHandler;
 import org.agrona.IoUtil;
 import org.agrona.concurrent.*;
@@ -27,14 +29,13 @@ import org.agrona.concurrent.status.CountersReader;
 
 import java.io.File;
 import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-import static java.nio.channels.FileChannel.MapMode.READ_ONLY;
+import static java.util.concurrent.atomic.AtomicIntegerFieldUpdater.newUpdater;
 import static org.agrona.IoUtil.mapExistingFile;
 
 /**
@@ -46,8 +47,13 @@ import static org.agrona.IoUtil.mapExistingFile;
  * <b>Note:</b> If {@link Aeron.Context#errorHandler(ErrorHandler)} is not set and a {@link DriverTimeoutException}
  * occurs then the process will face the wrath of {@link System#exit(int)}. See {@link #DEFAULT_ERROR_HANDLER}.
  */
-public final class Aeron implements AutoCloseable
+public class Aeron implements AutoCloseable
 {
+    /**
+     * Using an integer because there is no support for boolean. 1 is closed and 0 is not closed.
+     */
+    private static final AtomicIntegerFieldUpdater<Aeron> IS_CLOSED_UPDATER = newUpdater(Aeron.class, "isClosed");
+
     /**
      * The Default handler for Aeron runtime exceptions.
      * When a {@link io.aeron.exceptions.DriverTimeoutException} is encountered, this handler will
@@ -72,7 +78,7 @@ public final class Aeron implements AutoCloseable
     /**
      * Duration in milliseconds for which the client conductor will sleep between duty cycles.
      */
-    public static final long IDLE_SLEEP_MS = 16L;
+    public static final long IDLE_SLEEP_MS = 16;
 
     /**
      * Duration in nanoseconds for which the client conductor will sleep between duty cycles.
@@ -84,41 +90,32 @@ public final class Aeron implements AutoCloseable
      */
     public static final long KEEPALIVE_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(500);
 
-    /**
-     * Default interval that if exceeded between duty cycles the conductor will consider itself a zombie and suicide.
-     */
-    public static final long INTER_SERVICE_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(10);
-
-    /**
-     * Timeout after which if no status messages have been received then a publication is considered not connected.
-     */
-    public static final long PUBLICATION_CONNECTION_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(5);
-
-    private final Lock clientLock;
-    private final Context ctx;
+    @SuppressWarnings("unused") private volatile int isClosed;
+    private final long clientId;
     private final ClientConductor conductor;
-    private final AgentRunner conductorRunner;
-    private final AgentInvoker conductorInvoker;
     private final RingBuffer commandBuffer;
+    private final AgentInvoker conductorInvoker;
+    private final AgentRunner conductorRunner;
+    private final Context ctx;
 
     Aeron(final Context ctx)
     {
         ctx.conclude();
 
         this.ctx = ctx;
-        clientLock = ctx.clientLock();
-        commandBuffer = ctx.toDriverBuffer;
+        clientId = ctx.clientId();
+        commandBuffer = ctx.toDriverBuffer();
         conductor = new ClientConductor(ctx);
 
         if (ctx.useConductorAgentInvoker())
         {
-            conductorInvoker = new AgentInvoker(ctx.errorHandler, null, conductor);
+            conductorInvoker = new AgentInvoker(ctx.errorHandler(), null, conductor);
             conductorRunner = null;
         }
         else
         {
             conductorInvoker = null;
-            conductorRunner = new AgentRunner(ctx.idleStrategy, ctx.errorHandler, null, conductor);
+            conductorRunner = new AgentRunner(ctx.idleStrategy(), ctx.errorHandler(), null, conductor);
         }
     }
 
@@ -157,7 +154,7 @@ public final class Aeron implements AutoCloseable
             }
             else
             {
-                aeron.start(ctx.threadFactory);
+                AgentRunner.startOnThread(aeron.conductorRunner, ctx.threadFactory);
             }
 
             return aeron;
@@ -167,6 +164,36 @@ public final class Aeron implements AutoCloseable
             ctx.close();
             throw ex;
         }
+    }
+
+    /**
+     * Has the client been closed? If not then the CnC file may not be unmapped.
+     *
+     * @return true if the client has been explicitly closed otherwise false.
+     */
+    public boolean isClosed()
+    {
+        return 1 == isClosed;
+    }
+
+    /**
+     * Get the {@link Aeron.Context} that is used by this client.
+     *
+     * @return the {@link Aeron.Context} that is use by this client.
+     */
+    public Context context()
+    {
+        return ctx;
+    }
+
+    /**
+     * Get the client identity that has been allocated for communicating with the media driver.
+     *
+     * @return the client identity that has been allocated for communicating with the media driver.
+     */
+    public long clientId()
+    {
+        return clientId;
     }
 
     /**
@@ -180,12 +207,15 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Clean up and release all Aeron internal resources and shutdown threads.
+     * Clean up and release all Aeron client resources and shutdown conductor thread if not using
+     * {@link Context#useConductorAgentInvoker(boolean)}.
+     * <p>
+     * This will close all currently open {@link Publication}s, {@link Subscription}s, and {@link Counter}s created
+     * from this client.
      */
     public void close()
     {
-        clientLock.lock();
-        try
+        if (IS_CLOSED_UPDATER.compareAndSet(this, 0, 1))
         {
             if (null != conductorRunner)
             {
@@ -198,50 +228,30 @@ public final class Aeron implements AutoCloseable
 
             ctx.close();
         }
-        finally
-        {
-            clientLock.unlock();
-        }
     }
 
     /**
-     * Add a {@link Publication} for publishing messages to subscribers.
+     * Add a {@link Publication} for publishing messages to subscribers. The publication returned is threadsafe.
      *
-     * @param channel  for receiving the messages known to the media layer.
+     * @param channel  for sending the messages known to the media layer.
      * @param streamId within the channel scope.
-     * @return the new Publication.
+     * @return a new {@link ConcurrentPublication}.
      */
-    public Publication addPublication(final String channel, final int streamId)
+    public ConcurrentPublication addPublication(final String channel, final int streamId)
     {
-        clientLock.lock();
-        try
-        {
-            return conductor.addPublication(channel, streamId);
-        }
-        finally
-        {
-            clientLock.unlock();
-        }
+        return conductor.addPublication(channel, streamId);
     }
 
     /**
      * Add an {@link ExclusivePublication} for publishing messages to subscribers from a single thread.
      *
-     * @param channel  for receiving the messages known to the media layer.
+     * @param channel  for sending the messages known to the media layer.
      * @param streamId within the channel scope.
-     * @return the new Publication.
+     * @return a new {@link ExclusivePublication}.
      */
     public ExclusivePublication addExclusivePublication(final String channel, final int streamId)
     {
-        clientLock.lock();
-        try
-        {
-            return conductor.addExclusivePublication(channel, streamId);
-        }
-        finally
-        {
-            clientLock.unlock();
-        }
+        return conductor.addExclusivePublication(channel, streamId);
     }
 
     /**
@@ -257,15 +267,7 @@ public final class Aeron implements AutoCloseable
      */
     public Subscription addSubscription(final String channel, final int streamId)
     {
-        clientLock.lock();
-        try
-        {
-            return conductor.addSubscription(channel, streamId);
-        }
-        finally
-        {
-            clientLock.unlock();
-        }
+        return conductor.addSubscription(channel, streamId);
     }
 
     /**
@@ -290,15 +292,7 @@ public final class Aeron implements AutoCloseable
         final AvailableImageHandler availableImageHandler,
         final UnavailableImageHandler unavailableImageHandler)
     {
-        clientLock.lock();
-        try
-        {
-            return conductor.addSubscription(channel, streamId, availableImageHandler, unavailableImageHandler);
-        }
-        finally
-        {
-            clientLock.unlock();
-        }
+        return conductor.addSubscription(channel, streamId, availableImageHandler, unavailableImageHandler);
     }
 
     /**
@@ -313,7 +307,7 @@ public final class Aeron implements AutoCloseable
      */
     public long nextCorrelationId()
     {
-        if (conductor.isClosed())
+        if (1 == isClosed)
         {
             throw new IllegalStateException("Client is closed");
         }
@@ -322,25 +316,60 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Create and return a {@link CountersReader} for the Aeron media driver counters.
+     * Get the {@link CountersReader} for the Aeron media driver counters.
      *
      * @return new {@link CountersReader} for the Aeron media driver in use.
      */
     public CountersReader countersReader()
     {
-        if (conductor.isClosed())
+        if (1 == isClosed)
         {
             throw new IllegalStateException("Client is closed");
         }
 
-        return new CountersReader(ctx.countersMetaDataBuffer(), ctx.countersValuesBuffer(), StandardCharsets.US_ASCII);
+        return conductor.countersReader();
     }
 
-    private Aeron start(final ThreadFactory threadFactory)
+    /**
+     * Allocate a counter on the media driver and return a {@link Counter} for it.
+     * <p>
+     * The counter should be freed by calling {@link Counter#close()}.
+     *
+     * @param typeId      for the counter.
+     * @param keyBuffer   containing the optional key for the counter.
+     * @param keyOffset   within the keyBuffer at which the key begins.
+     * @param keyLength   of the key in the keyBuffer.
+     * @param labelBuffer containing the mandatory label for the counter. The label should not be length prefixed.
+     * @param labelOffset within the labelBuffer at which the label begins.
+     * @param labelLength of the label in the labelBuffer.
+     * @return the newly allocated counter.
+     * @see org.agrona.concurrent.status.CountersManager#allocate(int, DirectBuffer, int, int, DirectBuffer, int, int)
+     */
+    public Counter addCounter(
+        final int typeId,
+        final DirectBuffer keyBuffer,
+        final int keyOffset,
+        final int keyLength,
+        final DirectBuffer labelBuffer,
+        final int labelOffset,
+        final int labelLength)
     {
-        AgentRunner.startOnThread(conductorRunner, threadFactory);
+        return conductor.addCounter(typeId, keyBuffer, keyOffset, keyLength, labelBuffer, labelOffset, labelLength);
+    }
 
-        return this;
+    /**
+     * Allocate a counter on the media driver and return a {@link Counter} for it.
+     * <p>
+     * The counter should be freed by calling {@link Counter#close()}.
+     *
+     * @param typeId for the counter.
+     * @param label  for the counter. It should be US-ASCII.
+     * @return the newly allocated counter.
+     * @see org.agrona.concurrent.status.CountersManager#allocate(String, int)
+     */
+    public Counter addCounter(final int typeId, final String label)
+    {
+        return conductor.addCounter(typeId, label);
     }
 
     /**
@@ -355,6 +384,7 @@ public final class Aeron implements AutoCloseable
      */
     public static class Context extends CommonContext
     {
+        private long clientId;
         private boolean useConductorAgentInvoker = false;
         private AgentInvoker driverAgentInvoker;
         private Lock clientLock;
@@ -370,10 +400,10 @@ public final class Aeron implements AutoCloseable
         private ErrorHandler errorHandler;
         private AvailableImageHandler availableImageHandler;
         private UnavailableImageHandler unavailableImageHandler;
+        private AvailableCounterHandler availableCounterHandler;
+        private UnavailableCounterHandler unavailableCounterHandler;
         private long keepAliveInterval = KEEPALIVE_INTERVAL_NS;
         private long interServiceTimeout = 0;
-        private long publicationConnectionTimeout = PUBLICATION_CONNECTION_TIMEOUT_MS;
-        private FileChannel.MapMode imageMapMode;
         private ThreadFactory threadFactory = Thread::new;
 
         /**
@@ -435,14 +465,7 @@ public final class Aeron implements AutoCloseable
                 countersValuesBuffer(CncFileDescriptor.createCountersValuesBuffer(cncByteBuffer, cncMetaDataBuffer));
             }
 
-            if (0 == interServiceTimeout)
-            {
-                interServiceTimeout = CncFileDescriptor.clientLivenessTimeout(cncMetaDataBuffer);
-            }
-            else
-            {
-                interServiceTimeout = INTER_SERVICE_TIMEOUT_NS;
-            }
+            interServiceTimeout = CncFileDescriptor.clientLivenessTimeout(cncMetaDataBuffer);
 
             if (null == logBuffersFactory)
             {
@@ -454,17 +477,23 @@ public final class Aeron implements AutoCloseable
                 errorHandler = DEFAULT_ERROR_HANDLER;
             }
 
-            if (null == imageMapMode)
-            {
-                imageMapMode = READ_ONLY;
-            }
-
             if (null == driverProxy)
             {
-                driverProxy = new DriverProxy(toDriverBuffer);
+                clientId = toDriverBuffer.nextCorrelationId();
+                driverProxy = new DriverProxy(toDriverBuffer, clientId);
             }
 
             return this;
+        }
+
+        /**
+         * Get the client identity that has been allocated for communicating with the media driver.
+         *
+         * @return the client identity that has been allocated for communicating with the media driver.
+         */
+        public long clientId()
+        {
+            return clientId;
         }
 
         /**
@@ -612,7 +641,7 @@ public final class Aeron implements AutoCloseable
          * @param toClientBuffer Injected CopyBroadcastReceiver
          * @return this Aeron.Context for method chaining.
          */
-        public Context toClientBuffer(final CopyBroadcastReceiver toClientBuffer)
+        Context toClientBuffer(final CopyBroadcastReceiver toClientBuffer)
         {
             this.toClientBuffer = toClientBuffer;
             return this;
@@ -634,7 +663,7 @@ public final class Aeron implements AutoCloseable
          * @param toDriverBuffer Injected RingBuffer.
          * @return this Aeron.Context for method chaining.
          */
-        public Context toDriverBuffer(final RingBuffer toDriverBuffer)
+        Context toDriverBuffer(final RingBuffer toDriverBuffer)
         {
             this.toDriverBuffer = toDriverBuffer;
             return this;
@@ -656,7 +685,7 @@ public final class Aeron implements AutoCloseable
          * @param driverProxy for communicating with the media driver.
          * @return this Aeron.Context for method chaining.
          */
-        public Context driverProxy(final DriverProxy driverProxy)
+        Context driverProxy(final DriverProxy driverProxy)
         {
             this.driverProxy = driverProxy;
             return this;
@@ -678,7 +707,7 @@ public final class Aeron implements AutoCloseable
          * @param logBuffersFactory Injected LogBuffersFactory
          * @return this Aeron.Context for method chaining.
          */
-        public Context logBuffersFactory(final LogBuffersFactory logBuffersFactory)
+        Context logBuffersFactory(final LogBuffersFactory logBuffersFactory)
         {
             this.logBuffersFactory = logBuffersFactory;
             return this;
@@ -696,7 +725,12 @@ public final class Aeron implements AutoCloseable
 
         /**
          * Handle Aeron exceptions in a callback method. The default behavior is defined by
-         * {@link Aeron#DEFAULT_ERROR_HANDLER}.
+         * {@link Aeron#DEFAULT_ERROR_HANDLER}. This is the error handler which will be used if an error occurs
+         * during the callback for poll operations such as {@link Subscription#poll(FragmentHandler, int)}.
+         * <p>
+         * The error handler can be reset after {@link Aeron#connect()} and the latest version will always be used
+         * so that the boot strapping process can be performed such as replacing the default one with a
+         * {@link CountedErrorHandler}.
          *
          * @param errorHandler Method to handle objects of type Throwable.
          * @return this Aeron.Context for method chaining.
@@ -764,6 +798,50 @@ public final class Aeron implements AutoCloseable
         }
 
         /**
+         * Setup a callback for when a counter is available.
+         *
+         * @param handler to be called for handling available counter notifications.
+         * @return this Aeron.Context for fluent API.
+         */
+        public Context availableCounterHandler(final AvailableCounterHandler handler)
+        {
+            this.availableCounterHandler = handler;
+            return this;
+        }
+
+        /**
+         * Get the callback handler for when a counter is available.
+         *
+         * @return the callback handler for when a counter is available.
+         */
+        public AvailableCounterHandler availableCounterHandler()
+        {
+            return this.availableCounterHandler;
+        }
+
+        /**
+         * Setup a callback for when a counter is unavailable.
+         *
+         * @param handler to be called for handling unavailable counter notifications.
+         * @return this Aeron.Context for fluent API.
+         */
+        public Context unavailableCounterHandler(final UnavailableCounterHandler handler)
+        {
+            this.unavailableCounterHandler = handler;
+            return this;
+        }
+
+        /**
+         * Get the callback handler for when a counter is unavailable.
+         *
+         * @return the callback handler for when a counter is unavailable.
+         */
+        public UnavailableCounterHandler unavailableCounterHandler()
+        {
+            return this.unavailableCounterHandler;
+        }
+
+        /**
          * Set the interval in nanoseconds for which the client will perform keep-alive operations.
          *
          * @param value the interval in nanoseconds for which the client will perform keep-alive operations.
@@ -803,10 +881,10 @@ public final class Aeron implements AutoCloseable
         /**
          * Set the timeout between service calls the to {@link ClientConductor} duty cycles.
          *
-         * @param interServiceTimeout the timeout (ms) between service calls the to {@link ClientConductor} duty cycles.
+         * @param interServiceTimeout the timeout (ns) between service calls the to {@link ClientConductor} duty cycle.
          * @return this Aeron.Context for method chaining.
          */
-        public Context interServiceTimeout(final long interServiceTimeout)
+        Context interServiceTimeout(final long interServiceTimeout)
         {
             this.interServiceTimeout = interServiceTimeout;
             return this;
@@ -818,9 +896,10 @@ public final class Aeron implements AutoCloseable
          * When exceeded, {@link #errorHandler} will be called and the active {@link Publication}s and {@link Image}s
          * closed.
          * <p>
-         * This value is controlled by the driver and included in the CnC file.
+         * This value is controlled by the driver and included in the CnC file. It can be configured by adjusting
+         * the aeron.client.liveness.timeout property on the media driver.
          *
-         * @return the timeout between service calls in nanoseconds.
+         * @return the timeout in nanoseconds between service calls.
          */
         public long interServiceTimeout()
         {
@@ -834,52 +913,6 @@ public final class Aeron implements AutoCloseable
         {
             super.aeronDirectoryName(dirName);
             return this;
-        }
-
-        /**
-         * Set the amount of time, in milliseconds, that this client will use to determine if a {@link Publication}
-         * has active subscribers or not.
-         *
-         * @param value number of milliseconds.
-         * @return this Aeron.Context for method chaining.
-         */
-        public Context publicationConnectionTimeout(final long value)
-        {
-            publicationConnectionTimeout = value;
-            return this;
-        }
-
-        /**
-         * Return the timeout, in milliseconds, that this client will use to determine if a {@link Publication}
-         * has active subscribers or not.
-         *
-         * @return timeout in milliseconds.
-         */
-        public long publicationConnectionTimeout()
-        {
-            return publicationConnectionTimeout;
-        }
-
-        /**
-         * The file memory mapping mode for {@link Image}s.
-         *
-         * @param imageMapMode file memory mapping mode for {@link Image}s.
-         * @return this for a fluent API.
-         */
-        public Context imageMapMode(final FileChannel.MapMode imageMapMode)
-        {
-            this.imageMapMode = imageMapMode;
-            return this;
-        }
-
-        /**
-         * The file memory mapping mode for {@link Image}s.
-         *
-         * @return the file memory mapping mode for {@link Image}s.
-         */
-        public FileChannel.MapMode imageMapMode()
-        {
-            return imageMapMode;
         }
 
         /**
@@ -935,7 +968,7 @@ public final class Aeron implements AutoCloseable
                 cncMetaDataBuffer = CncFileDescriptor.createMetaDataBuffer(cncByteBuffer);
 
                 int cncVersion;
-                while (0 == (cncVersion = cncMetaDataBuffer.getInt(CncFileDescriptor.cncVersionOffset(0))))
+                while (0 == (cncVersion = cncMetaDataBuffer.getIntVolatile(CncFileDescriptor.cncVersionOffset(0))))
                 {
                     if (epochClock.time() > (startTimeMs + driverTimeoutMs()))
                     {

@@ -40,6 +40,7 @@ Aeron::Aeron(Context &context) :
     m_cncBuffer(mapCncFile(context)),
     m_toDriverAtomicBuffer(CncFileDescriptor::createToDriverBuffer(m_cncBuffer)),
     m_toClientsAtomicBuffer(CncFileDescriptor::createToClientsBuffer(m_cncBuffer)),
+    m_countersMetadataBuffer(CncFileDescriptor::createCounterMetadataBuffer(m_cncBuffer)),
     m_countersValueBuffer(CncFileDescriptor::createCounterValuesBuffer(m_cncBuffer)),
     m_toDriverRingBuffer(m_toDriverAtomicBuffer),
     m_driverProxy(m_toDriverRingBuffer),
@@ -49,23 +50,40 @@ Aeron::Aeron(Context &context) :
         currentTimeMillis,
         m_driverProxy,
         m_toClientsCopyReceiver,
+        m_countersMetadataBuffer,
         m_countersValueBuffer,
         context.m_onNewPublicationHandler,
         context.m_onNewSubscriptionHandler,
         context.m_exceptionHandler,
+        context.m_onAvailableCounterHandler,
+        context.m_onUnavailableCounterHandler,
         context.m_mediaDriverTimeout,
         context.m_resourceLingerTimeout,
-        CncFileDescriptor::clientLivenessTimeout(m_cncBuffer),
-        context.m_publicationConnectionTimeout),
+        CncFileDescriptor::clientLivenessTimeout(m_cncBuffer)),
     m_idleStrategy(IDLE_SLEEP_MS),
-    m_conductorRunner(m_conductor, m_idleStrategy, m_context.m_exceptionHandler)
+    m_conductorRunner(m_conductor, m_idleStrategy, m_context.m_exceptionHandler),
+    m_conductorInvoker(m_conductor, m_context.m_exceptionHandler)
 {
-    m_conductorRunner.start();
+    if (m_context.m_useConductorAgentInvoker)
+    {
+        m_conductorInvoker.start();
+    }
+    else
+    {
+        m_conductorRunner.start();
+    }
 }
 
 Aeron::~Aeron()
 {
-    m_conductorRunner.close();
+    if (m_context.m_useConductorAgentInvoker)
+    {
+        m_conductorInvoker.close();
+    }
+    else
+    {
+        m_conductorRunner.close();
+    }
 
     // memory mapped files should be free'd by the destructor of the shared_ptr
 }
@@ -92,7 +110,7 @@ inline MemoryMappedFile::ptr_t Aeron::mapCncFile(Context &context)
 
         std::int32_t cncVersion = 0;
 
-        while (0 == (cncVersion = CncFileDescriptor::cncVersion(cncBuffer)))
+        while (0 == (cncVersion = CncFileDescriptor::cncVersionVolatile(cncBuffer)))
         {
             if (currentTimeMillis() > (startMs + context.m_mediaDriverTimeout))
             {
